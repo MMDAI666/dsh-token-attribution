@@ -42,6 +42,10 @@ The session tree starts with root sessions only. Every row shows **subtree total
 
 Session titles resolve at render time from the live `useSessions` store (`displayTitle`, then `title`, then the compact id). Titles are never persisted or sent over RPC. Up to 500 sessions are returned; the tree shows all roots in the range.
 
+Since M3, clicking a session title opens an in-place **session drill-down** (the chevron still only expands the tree). It defaults to the session plus its descendant subtree and has a `含子代理 / 仅本会话` switch that refetches the scoped data. The detail header has a back action and ancestor breadcrumb; direct child sessions are listed with their subtree totals and can be opened for further drilling. The mini dashboard contains session cards, purpose, models, content sources, tool groups, search/fetch calls, daily trend, and paginated request rows for the selected session set. Drill state survives switching main tabs; a range change refetches it.
+
+Session drill-down data comes from the Host's on-demand `sessionDetail` aggregation over retained request detail (the same 30-day window as the panel ranges). When detail is unavailable, cards fall back to the aggregated `bySession` row and the breakdown sections are replaced by a localized retention note; partial detail is marked separately. The range-level Web API `unattributed` remainder is never attributed to a session. There is no URL deep link and no per-session export in v1.
+
 The full search/fetch sessions table follows the tree.
 
 ### Sources

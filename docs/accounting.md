@@ -106,6 +106,16 @@ Since M2.5 the observer records the agent session attached to each counted call 
 - A session whose calls all failed still appears, with an em-dash cost (only successes are billable).
 - Malformed day files and malformed buckets are tolerated per day; missing counters default to zero.
 
+### Session drill-down
+
+The Sessions tab calls the Host's `sessionDetail` RPC with `{range, sessionId, includeDescendants}`. The Host resolves the session plus descendants from the full-range `bySession` rows, then rebuilds the scoped summary from retained request detail: totals, purpose, models, content sources, tool groups, daily rows, cache, and cost are all filtered to that session set. The response also carries the selected session row, its direct children, `sessionIds`, a session-scoped Web API block, and `detailAvailable` / `detailPartial` / `detailReason`.
+
+- Detail aggregation uses the request-detail retention window (default 30 days), which covers the panel's `today` / `7d` / `30d` ranges. There is no per-session 365-day aggregate.
+- If detail rows are missing, the cards are synthesized from the aggregated `bySession` row and breakdowns are empty with `detailAvailable:false`; partial detail is reported rather than silently presented as complete.
+- Session-scoped search/fetch counters are read directly from the Web API session buckets, not from the range's capped `bySession` list, so a session beyond the 100-row display cap still reports its calls.
+- The embedded request table calls `requests` with `sessionIds` (1–500 ids) in subtree mode, or `sessionId` in single-session mode; totals are computed before pagination.
+- There is no per-session dedicated export or URL route in v1; the global range export and Details filters are unchanged.
+
 ### Unattributed rows (pre-M2.5 history)
 
 M2.4 day files carried only daily totals and no `sessions` map. Those calls cannot be attributed to a conversation, so the Host exposes `summary.webApi.unattributed`: the exact remainder

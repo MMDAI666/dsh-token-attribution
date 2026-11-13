@@ -18,6 +18,9 @@ const RANGE_DAYS = Object.freeze({ today: 0, '7d': 6, '30d': 29 })
 /** Maximum pages size accepted by `requests`. */
 const MAX_REQUEST_LIMIT = 200
 
+/** Maximum number of session ids accepted by a `requests` set filter. */
+const MAX_REQUEST_SESSION_IDS = 500
+
 /** Export content cap in UTF-8 bytes (2 MiB). */
 export const EXPORT_MAX_BYTES = 2 * 1024 * 1024
 
@@ -338,6 +341,15 @@ export function createRpcHandler({ store, configModule, configState, ctx, diag }
           if (body.sessionId !== undefined && (typeof body.sessionId !== 'string' || body.sessionId.length === 0)) {
             badRequest('sessionId must be a non-empty string', { field: 'sessionId' })
           }
+          if (body.sessionIds !== undefined) {
+            const sessionIds = body.sessionIds
+            if (!Array.isArray(sessionIds)
+              || sessionIds.length < 1
+              || sessionIds.length > MAX_REQUEST_SESSION_IDS
+              || sessionIds.some(id => typeof id !== 'string' || id.length === 0)) {
+              badRequest(`sessionIds must be an array of 1..${MAX_REQUEST_SESSION_IDS} non-empty strings`, { field: 'sessionIds' })
+            }
+          }
           return success(store.readRequests({
             date: body.date,
             from: body.from,
@@ -346,6 +358,26 @@ export function createRpcHandler({ store, configModule, configState, ctx, diag }
             offset,
             purpose: body.purpose,
             sessionId: body.sessionId,
+            sessionIds: body.sessionIds,
+          }))
+        }
+        case 'sessionDetail': {
+          const { from, to } = resolveRange(payload, 'sessionDetail')
+          const body = objectPayload(payload, 'sessionDetail')
+          if (typeof body.sessionId !== 'string' || body.sessionId.length === 0) {
+            badRequest('sessionId must be a non-empty string', { field: 'sessionId' })
+          }
+          if (body.includeDescendants !== undefined && typeof body.includeDescendants !== 'boolean') {
+            badRequest('includeDescendants must be a boolean', { field: 'includeDescendants' })
+          }
+          // The feature defaults to including descendants; the client always
+          // sends the flag explicitly, and an explicit `false` narrows the scan.
+          const includeDescendants = body.includeDescendants !== false
+          return success(store.readSessionDetail({
+            from,
+            to,
+            sessionId: body.sessionId,
+            includeDescendants,
           }))
         }
         case 'meta':

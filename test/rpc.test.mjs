@@ -31,6 +31,10 @@ const createFakeStore = () => {
       calls.push(['requests', query])
       return { items: [], total: 0 }
     },
+    readSessionDetail(query) {
+      calls.push(['sessionDetail', query])
+      return { generatedAt: 1, range: { from: query.from, to: query.to }, sessionId: query.sessionId, includeDescendants: query.includeDescendants }
+    },
     readMeta() {
       calls.push(['meta'])
       return { version: '0.1.0', readOnly: false }
@@ -171,6 +175,7 @@ test('requests validates limit, offset, dates, and purpose', async () => {
     offset: 5,
     purpose: 'chat',
     sessionId: undefined,
+    sessionIds: undefined,
   }])
 
   for (const payload of [
@@ -208,6 +213,7 @@ test('requests passes sessionId through and rejects an invalid one', async () =>
     offset: 0,
     purpose: 'chat',
     sessionId: 'session-1',
+    sessionIds: undefined,
   }])
 
   // An unknown session id is a valid filter; the store decides it matches nothing.
@@ -585,6 +591,106 @@ test('export rejects unknown formats and invalid ranges as bad-request', async (
   ]) {
     const result = await handler('export', payload)
     assert.equal(result.ok, false, JSON.stringify(payload))
+    assert.equal(result.error.code, 'bad-request')
+  }
+  assert.equal(store.calls.length, 0)
+})
+
+test('requests accepts a sessionIds set filter and validates it', async () => {
+  const store = createFakeStore()
+  const handler = createRpcHandler({ store, configModule, configState: createConfigState(), ctx: createContext() })
+
+  const scoped = await handler('requests', {
+    from: '2026-11-01',
+    to: '2026-11-12',
+    sessionIds: ['alpha', 'beta'],
+  })
+  assert.equal(scoped.ok, true)
+  assert.deepEqual(store.calls.at(-1)[1].sessionIds, ['alpha', 'beta'])
+  assert.equal(store.calls.at(-1)[1].sessionId, undefined)
+
+  // The endpoint accepts the documented 500-id cap and rejects one more.
+  const atCap = Array.from({ length: 500 }, (_, index) => `session-${index}`)
+  const capped = await handler('requests', { sessionIds: atCap })
+  assert.equal(capped.ok, true)
+  assert.deepEqual(store.calls.at(-1)[1].sessionIds, atCap)
+
+  const invalidPayloads = [
+    [],
+    [''],
+    ['ok', ''],
+    ['ok', 42],
+    'alpha',
+    42,
+    {},
+    Array.from({ length: 501 }, (_, index) => `session-${index}`),
+  ]
+  for (const sessionIds of invalidPayloads) {
+    const result = await handler('requests', { sessionIds })
+    assert.equal(result.ok, false, `sessionIds=${JSON.stringify(sessionIds)}`)
+    assert.equal(result.error.code, 'bad-request')
+    assert.deepEqual(result.error.details, { field: 'sessionIds' })
+  }
+})
+
+test('sessionDetail resolves ranges and defaults includeDescendants to true', async () => {
+  const store = createFakeStore()
+  const handler = createRpcHandler({ store, configModule, configState: createConfigState(), ctx: createContext() })
+  const today = dayKey(Date.now())
+
+  const defaulted = await handler('sessionDetail', { range: '7d', sessionId: 'session-1' })
+  assert.equal(defaulted.ok, true)
+  assert.deepEqual(store.calls.at(-1), ['sessionDetail', {
+    from: shiftDays(today, -6),
+    to: today,
+    sessionId: 'session-1',
+    includeDescendants: true,
+  }])
+  assert.deepEqual(defaulted.value.range, { from: shiftDays(today, -6), to: today })
+  assert.equal(defaulted.value.includeDescendants, true)
+
+  const explicit = await handler('sessionDetail', {
+    from: '2026-11-01',
+    to: '2026-11-03',
+    sessionId: 'session-2',
+    includeDescendants: false,
+  })
+  assert.equal(explicit.ok, true)
+  assert.deepEqual(store.calls.at(-1), ['sessionDetail', {
+    from: '2026-11-01',
+    to: '2026-11-03',
+    sessionId: 'session-2',
+    includeDescendants: false,
+  }])
+  assert.equal(explicit.value.includeDescendants, false)
+
+  const todayRange = await handler('sessionDetail', { sessionId: 'session-3' })
+  assert.equal(todayRange.ok, true)
+  assert.deepEqual(todayRange.value.range, { from: today, to: today })
+  assert.equal(todayRange.value.includeDescendants, true)
+})
+
+test('sessionDetail rejects invalid payloads as bad-request', async () => {
+  const store = createFakeStore()
+  const handler = createRpcHandler({ store, configModule, configState: createConfigState(), ctx: createContext() })
+
+  const invalidPayloads = [
+    {},
+    { sessionId: '' },
+    { sessionId: 42 },
+    { sessionId: null },
+    { sessionId: ['session-1'] },
+    { sessionId: 'session-1', includeDescendants: 'yes' },
+    { sessionId: 'session-1', includeDescendants: 1 },
+    { range: 'year', sessionId: 'session-1' },
+    { from: '2026-02-30', sessionId: 'session-1' },
+    { to: 'nope', sessionId: 'session-1' },
+    { from: '2026-11-05', to: '2026-11-01', sessionId: 'session-1' },
+    42,
+  ]
+  for (const payload of invalidPayloads) {
+    const result = await handler('sessionDetail', payload)
+    assert.equal(result.ok, false, `payload=${JSON.stringify(payload)}`)
     assert.equal(result.error.code, 'bad-request')
   }
   assert.equal(store.calls.length, 0)

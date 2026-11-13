@@ -9,7 +9,7 @@
 - **全量调用捕获**：观察 `llm/stream`，覆盖主对话、子代理、`auto-review`、`compaction`、`session-title` 与重试 attempt，总量锚定 provider 真实 usage。
 - **归因与费用**：按调用目的、内容来源分组（含记忆/技能）、会话树、模型拆分；按北京时间自动选择高峰/空闲价，价目表可配，可补法定节假日日期。
 - **搜索/抓取监控**：统计 Host 观察到的 `web_search` / `web_fetch` 次数并估算费用，可归因到具体对话；升级前（M2.5 之前）的调用以「未归因」余量显式呈现。
-- **七标签页面板**：概览 / 会话 / 模型 / 来源 / 搜索 / 明细 / 设置；共享时间范围、刷新与 JSON/CSV 导出；请求明细分页；会话标题渲染时解析；可选记住上次标签页。
+- **七标签页面板**：概览 / 会话 / 模型 / 来源 / 搜索 / 明细 / 设置；共享时间范围、刷新与 JSON/CSV 导出；请求明细分页；会话标题渲染时解析；会话 Tab 支持进入单会话详情（含子代理子树切换）；可选记住上次标签页。
 
 ## 快速开始
 
@@ -31,6 +31,7 @@
 
 ## 最近更新
 
+- **M3** — 「会话」Tab 可点击进入单会话详情：默认含子代理子树、可切换仅本会话；迷你看板含会话卡、purpose、模型、内容来源、工具分组、搜索/抓取、趋势、子会话与请求明细；父/子会话可导航，切换 Tab 保留选中，范围变化重算。
 - **M2.10** — 自动审查（auto-review）每次重发的合成 user 角色转录从**用户**中拆出，单列为**自动审查**内容来源分组（保留明细已迁移；更早只有日聚合的日期不变；真正的聊天用户文本仅占聊天 prompt 约 0.5%）。
 - **M2.8** — 默认工具分组更丰富（`files`、`shell`、`web`、`session`、`goals`、`schedule`、`subagents`、`plugins`、`browser`、`workflow`），并支持任意自定义分组键。
 - **M2.7** — **Web** 标签页更名为 **搜索**；搜索/抓取会话表增加「未归因（升级前仅总量）」行，使卡片总数与会话行可对账。
@@ -44,7 +45,7 @@
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | 13 个 Config 字段、价格/分时/节假日/Web API 默认值、`dataDir` 迁移、需重启字段、`rememberLastTab`、旧 Host 保存守卫。 |
 | [docs/accounting.md](docs/accounting.md) | token 口径与 `char-v1` 估算、高峰/空闲计价、Web API 计数口径与限制、M2.5 之前的未归因行、隐私。 |
-| [docs/ui.md](docs/ui.md) | 七个标签页、共享范围/刷新/导出、明细分页与筛选、设置行为、会话标题、命名。 |
+| [docs/ui.md](docs/ui.md) | 七个标签页、共享范围/刷新/导出、会话下钻、明细分页与筛选、设置行为、会话标题、命名。 |
 | [README.zh.md](README.zh.md) | 完整中文镜像（与本文中文部分相同）。 |
 
 ## 隐私
@@ -58,7 +59,7 @@ node --check index.js
 node --test --test-isolation=none "test/*.test.mjs"
 ```
 
-当前单测为 **265 个**（2026-11-13 实测；M2.10 收尾期间数量可能继续变化，按近似值看待）。测试使用 `node:test`、合成 fixture 与临时 `DSH_HOME`，不会读写真实 profile。在 DSH Windows 沙箱内请使用上面的 in-process runner（`--test-isolation=none`）：默认 runner 以管道 stdio 启动子进程，会报 `spawn EPERM`。
+当前单测为 **285 个**（2026-11-13 实测；M3 收尾期间数量可能继续变化，按近似值看待）。测试使用 `node:test`、合成 fixture 与临时 `DSH_HOME`，不会读写真实 profile。在 DSH Windows 沙箱内请使用上面的 in-process runner（`--test-isolation=none`）：默认 runner 以管道 stdio 启动子进程，会报 `spawn EPERM`。
 
 要求 Node.js 24+，DSH 引擎范围为 `>=0.2.1-rc.1 <0.3.0`；零运行时依赖、无构建步骤。
 
@@ -79,7 +80,7 @@ A DSH plugin that records every model call in the running profile — including 
 - **Full call capture.** An observer on `llm/stream` sees main chat, subagents, `auto-review`, `compaction`, `session-title`, and retry attempts, all anchored to measured provider usage.
 - **Attribution and cost.** Purpose, content-source groups (including memory/skill), session tree, per-model split; tiered peak/off-peak pricing in Asia/Shanghai, configurable price table, and optional holiday dates.
 - **Search & fetch tracking.** Host-observed `web_search` / `web_fetch` counts and estimated cost, attributed per conversation, with an explicit unattributed remainder for pre-M2.5 history.
-- **Seven-tab panel.** Overview / Sessions / Models / Sources / Search / Details / Settings, with a shared range, refresh, and JSON/CSV export, paginated request details, render-time session titles, and optional last-tab memory.
+- **Seven-tab panel.** Overview / Sessions / Models / Sources / Search / Details / Settings, with a shared range, refresh, and JSON/CSV export, paginated request details, render-time session titles, a single-session drill-down on the Sessions tab (with subtree toggle), and optional last-tab memory.
 
 ### Quick start
 
@@ -101,6 +102,7 @@ Uninstall with the plugin manager's **remove bundle** action. Removal does not d
 
 ### What's new
 
+- **M3** — the Sessions tab opens a single-session drill-down (subtree by default, switchable to this session only): overview cards, purpose, models, content sources, tool groups, search/fetch, trend, child sessions, and paginated requests; parent/child navigation, selection survives tab switches, and a range change refetches.
 - **M2.10** — auto-review's synthetic user-role transcript is split out of **用户 / User** into its own **自动审查 / Auto review** content-source group (retained detail migrated; daily-only older days unchanged; genuine chat user text is ~0.5% of the chat prompt).
 - **M2.8** — richer default tool groups (`files`, `shell`, `web`, `session`, `goals`, `schedule`, `subagents`, `plugins`, `browser`, `workflow`) plus arbitrary custom group keys.
 - **M2.7** — the **Web** tab is renamed **Search**, and the search/fetch sessions table gains an explicit pre-M2.5 unattributed row so the card total reconciles with attributed rows.
@@ -114,7 +116,7 @@ Uninstall with the plugin manager's **remove bundle** action. Removal does not d
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | All 13 Config fields, pricing/off-peak/holiday/Web API defaults, `dataDir` migration, restart-required fields, `rememberLastTab`, older-Host save guard. |
 | [docs/accounting.md](docs/accounting.md) | Token accounting and `char-v1` estimates, peak/off-peak pricing, Web API counts and their limits, unattributed pre-M2.5 rows, privacy. |
-| [docs/ui.md](docs/ui.md) | The seven tabs, shared range/refresh/export, Details pagination and filters, Settings behavior, session titles, naming. |
+| [docs/ui.md](docs/ui.md) | The seven tabs, shared range/refresh/export, session drill-down, Details pagination and filters, Settings behavior, session titles, naming. |
 | [README.zh.md](README.zh.md) | Full Chinese mirror (same as the Chinese half of this file). |
 
 ### Privacy
@@ -128,7 +130,7 @@ node --check index.js
 node --test --test-isolation=none "test/*.test.mjs"
 ```
 
-The suite currently reports **265 tests** (observed 2026-11-13; the count is approximate while M2.10 settles). Tests use `node:test`, synthetic fixtures, and temporary `DSH_HOME` directories — they never read or write a real profile. In the DSH Windows sandbox use the in-process runner (`--test-isolation=none`) as shown; the default runner spawns child processes with piped stdio and fails with `spawn EPERM`.
+The suite currently reports **285 tests** (observed 2026-11-13; the count is approximate while M3 settles). Tests use `node:test`, synthetic fixtures, and temporary `DSH_HOME` directories — they never read or write a real profile. In the DSH Windows sandbox use the in-process runner (`--test-isolation=none`) as shown; the default runner spawns child processes with piped stdio and fails with `spawn EPERM`.
 
 Requires Node.js 24 or newer and the DSH `>=0.2.1-rc.1 <0.3.0` engine range. No runtime dependencies and no build step.
 

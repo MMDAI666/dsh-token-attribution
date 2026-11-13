@@ -2375,3 +2375,458 @@ test('unattributed failed calls stay unbilled and use the configured currency', 
   assert.equal(store.readSummary({ from: day, to: day }).webApi.cost.currency, 'USD')
   store.dispose()
 })
+
+test('readSessionDetail scopes a full dashboard to one session and its subtree', (t) => {
+  const home = tempHome(t)
+  const store = createStore({ config: makeConfig(), homeDir: home, profile: 'test' })
+  const today = dayKey(Date.now())
+  const day1 = shiftDays(today, -2)
+  const day2 = shiftDays(today, -1)
+  const at = (day, time) => new Date(`${day}T${time}:00`).getTime()
+  const records = [
+    makeRecord({
+      id: 'p1',
+      ts: at(day1, '10:00'),
+      sessionId: 'parent',
+      purpose: 'chat',
+      promptTokens: 100,
+      outputTokens: 10,
+      categories: { user: 70, 'system:base': 30 },
+      usage: { input: 90, cacheRead: 10, cacheWrite: 0, output: 10 },
+      cost: { amount: 0.01, priced: true, currency: 'CNY' },
+    }),
+    makeRecord({
+      id: 'c1',
+      ts: at(day1, '11:00'),
+      sessionId: 'child',
+      parentSessionId: 'parent',
+      delegationDepth: 1,
+      purpose: 'auto-review',
+      model: 'deepseek-pro',
+      promptTokens: 50,
+      outputTokens: 5,
+      categories: { 'injected:memory-snapshot': 50 },
+      usage: { input: 40, cacheRead: 10, cacheWrite: 0, output: 5 },
+      cost: { amount: 0.02, priced: true, currency: 'CNY' },
+    }),
+    makeRecord({
+      id: 'g1',
+      ts: at(day2, '10:00'),
+      sessionId: 'grand',
+      parentSessionId: 'child',
+      delegationDepth: 2,
+      purpose: 'compaction',
+      promptTokens: 30,
+      outputTokens: 3,
+      categories: { 'tool-result:other:read': 30 },
+      usage: { input: 20, cacheRead: 10, cacheWrite: 0, output: 3 },
+      cost: { amount: 0, priced: false, currency: 'CNY' },
+    }),
+    makeRecord({
+      id: 'c2',
+      ts: at(day2, '11:00'),
+      sessionId: 'child2',
+      parentSessionId: 'parent',
+      delegationDepth: 1,
+      purpose: 'chat',
+      model: 'deepseek-pro',
+      promptTokens: 20,
+      outputTokens: 2,
+      categories: { 'injected:skill': 20 },
+      usage: { input: 20, cacheRead: 0, cacheWrite: 0, output: 2 },
+      cost: { amount: 0.005, priced: true, currency: 'CNY' },
+    }),
+    makeRecord({
+      id: 'o1',
+      ts: at(day1, '12:00'),
+      sessionId: 'other',
+      purpose: 'chat',
+      model: 'other-model',
+      promptTokens: 999,
+      outputTokens: 99,
+      categories: { user: 999 },
+      cost: { amount: 9, priced: true, currency: 'CNY' },
+    }),
+  ]
+  for (const record of records) assert.equal(store.append(record), true)
+  store.flushNow()
+
+  // Attributed Web API calls for the selected tree plus an unrelated session.
+  store.recordWebApiCall({ ts: at(day1, '10:30'), tool: 'search', ok: true, sessionId: 'parent' })
+  store.recordWebApiCall({ ts: at(day1, '11:30'), tool: 'fetch', ok: false, sessionId: 'child' })
+  store.recordWebApiCall({ ts: at(day2, '09:00'), tool: 'search', ok: true, sessionId: 'other' })
+  store.recordWebApiCall({ ts: at(day2, '09:30'), tool: 'fetch', ok: true, sessionId: 'grand' })
+
+  const fullSummary = store.readSummary({ from: day1, to: day2 })
+  assert.ok(fullSummary.bySession.some(row => row.sessionId === 'other'))
+
+  const detail = store.readSessionDetail({ from: day1, to: day2, sessionId: 'parent', includeDescendants: true })
+  assert.equal(detail.sessionId, 'parent')
+  assert.equal(detail.includeDescendants, true)
+  assert.deepEqual(detail.range, { from: day1, to: day2 })
+  assert.equal(detail.detailAvailable, true)
+  assert.equal(detail.detailPartial, false)
+  assert.equal(detail.detailReason, null)
+  assert.deepEqual(Object.keys(detail.summary).sort(), Object.keys(fullSummary).sort(),
+    'the drill-down summary keeps the readSummary shape')
+  assert.equal(detail.session.sessionId, 'parent')
+  assert.equal(detail.session.requests, 1)
+  assert.equal(detail.session.tokens, 110)
+  // Direct children only; the grandchild is included through the descendant
+  // walk but is not listed as a direct child.
+  assert.deepEqual(detail.children.map(row => row.sessionId), ['child', 'child2'])
+  assert.deepEqual(detail.sessionIds, ['parent', 'child', 'child2', 'grand'])
+
+  const summary = detail.summary
+  assert.equal(summary.totals.requests, 4)
+  assert.equal(summary.totals.promptTokens, 200)
+  assert.equal(summary.totals.outputTokens, 20)
+  assert.equal(summary.totals.totalTokens, 220)
+  assert.equal(summary.totals.measuredRequests, 4)
+  assert.equal(summary.totals.estimatedRequests, 0)
+  assert.deepEqual([...summary.bySession].map(row => row.sessionId).sort(), ['child', 'child2', 'grand', 'parent'])
+  assert.equal(summary.bySession.reduce((sum, row) => sum + row.requests, 0), summary.totals.requests)
+  assert.equal(summary.bySession.reduce((sum, row) => sum + row.tokens, 0), summary.totals.totalTokens)
+  assert.deepEqual(summary.byPurpose, {
+    chat: { requests: 2, promptTokens: 120, outputTokens: 12, cost: { amount: 0.015, currency: 'CNY', priced: true, unpricedRequests: 0 } },
+    'auto-review': { requests: 1, promptTokens: 50, outputTokens: 5, cost: { amount: 0.02, currency: 'CNY', priced: true, unpricedRequests: 0 } },
+    compaction: { requests: 1, promptTokens: 30, outputTokens: 3, cost: { amount: 0, currency: 'CNY', priced: false, unpricedRequests: 1 } },
+  })
+  assert.deepEqual(summary.byCategory, {
+    user: 70,
+    'system:base': 30,
+    'injected:memory-snapshot': 50,
+    'tool-result:other:read': 30,
+    'injected:skill': 20,
+  })
+  assert.deepEqual(summary.byCategoryGroup, {
+    user: 70,
+    system: 30,
+    memory: 50,
+    'tool-result': 30,
+    skill: 20,
+  })
+  assert.deepEqual(summary.byToolGroup, { 'other:read': 30 })
+  assert.equal(summary.byModel.length, 2)
+  const flash = summary.byModel.find(row => row.model === 'deepseek-flash')
+  const pro = summary.byModel.find(row => row.model === 'deepseek-pro')
+  assert.equal(flash.requests, 2)
+  assert.equal(flash.promptTokens, 130)
+  assert.equal(pro.requests, 2)
+  assert.equal(pro.promptTokens, 70)
+  assert.equal(summary.byModel.some(row => row.model === 'other-model'), false)
+  assert.deepEqual(summary.byDay, [
+    {
+      day: day1,
+      requests: 2,
+      promptTokens: 150,
+      outputTokens: 15,
+      estimatedRequests: 0,
+      cost: { amount: 0.03, currency: 'CNY', priced: true, unpricedRequests: 0 },
+      costByCurrency: { CNY: { amount: 0.03, priced: true, unpricedRequests: 0 } },
+    },
+    {
+      day: day2,
+      requests: 2,
+      promptTokens: 50,
+      outputTokens: 5,
+      estimatedRequests: 0,
+      cost: { amount: 0.005, currency: 'CNY', priced: true, unpricedRequests: 1 },
+      costByCurrency: { CNY: { amount: 0.005, priced: true, unpricedRequests: 1 } },
+    },
+  ])
+  assert.deepEqual(summary.cache, { input: 170, read: 30, write: 0, hitRate: 0.15 })
+  assert.deepEqual(summary.cost, { amount: 0.035, currency: 'CNY', priced: true, unpricedRequests: 1 })
+  assert.deepEqual(summary.totals.costByCurrency, {
+    CNY: { amount: 0.035, priced: true, unpricedRequests: 1 },
+  })
+  assert.equal(summary.data.readOnly, false)
+
+  // Web API rows are filtered to the selected sessions; the range remainder
+  // belongs to no session and never appears in a drill-down.
+  assert.deepEqual(detail.webApi.search, { ok: 1, failed: 0, total: 1 })
+  assert.deepEqual(detail.webApi.fetch, { ok: 1, failed: 1, total: 2 })
+  assert.deepEqual(detail.webApi.calls, { ok: 2, failed: 1, total: 3 })
+  assert.deepEqual(detail.webApi.cost, { amount: 0.01, currency: 'CNY', priced: true })
+  assert.deepEqual(detail.webApi.bySession.map(row => row.sessionId).sort(), ['child', 'grand', 'parent'])
+  assert.equal(Object.hasOwn(detail.webApi, 'unattributed'), false)
+  assert.deepEqual(summary.webApi.search, detail.webApi.search)
+  assert.deepEqual(summary.webApi.unattributed.calls, { ok: 0, failed: 0, total: 0 })
+
+  // `includeDescendants:false` keeps direct children visible but scopes the
+  // summary to the selected session alone.
+  const single = store.readSessionDetail({ from: day1, to: day2, sessionId: 'parent', includeDescendants: false })
+  assert.equal(single.includeDescendants, false)
+  assert.deepEqual(single.sessionIds, ['parent'])
+  assert.deepEqual(single.children.map(row => row.sessionId), ['child', 'child2'])
+  assert.equal(single.summary.totals.requests, 1)
+  assert.deepEqual(single.summary.bySession.map(row => row.sessionId), ['parent'])
+  assert.deepEqual(single.summary.byPurpose, {
+    chat: { requests: 1, promptTokens: 100, outputTokens: 10, cost: { amount: 0.01, currency: 'CNY', priced: true, unpricedRequests: 0 } },
+  })
+  assert.deepEqual(single.webApi.bySession.map(row => row.sessionId), ['parent'])
+  assert.deepEqual(single.webApi.search, { ok: 1, failed: 0, total: 1 })
+  assert.deepEqual(single.webApi.fetch, { ok: 0, failed: 0, total: 0 })
+  assert.equal(single.webApi.cost.amount, 0.005)
+
+  // The feature defaults to including descendants when the flag is omitted.
+  const defaulted = store.readSessionDetail({ from: day1, to: day2, sessionId: 'parent' })
+  assert.equal(defaulted.includeDescendants, true)
+  assert.deepEqual(defaulted.sessionIds, ['parent', 'child', 'child2', 'grand'])
+  store.dispose()
+})
+
+test('readSessionDetail synthesizes cards from bySession when detail is gone', (t) => {
+  const home = tempHome(t)
+  const store = createStore({ config: makeConfig(), homeDir: home, profile: 'test' })
+  const day = shiftDays(dayKey(Date.now()), -1)
+  const at = new Date(`${day}T10:00:00`).getTime()
+  store.append(makeRecord({
+    id: 'p1',
+    ts: at,
+    sessionId: 'parent',
+    purpose: 'chat',
+    promptTokens: 100,
+    outputTokens: 10,
+    categories: { user: 100 },
+    usage: { input: 80, cacheRead: 20, cacheWrite: 0, output: 10 },
+    cost: { amount: 0.01, priced: true, currency: 'CNY' },
+  }))
+  store.append(makeRecord({
+    id: 'c1',
+    ts: at + 1000,
+    sessionId: 'child',
+    parentSessionId: 'parent',
+    delegationDepth: 1,
+    purpose: 'auto-review',
+    promptTokens: 50,
+    outputTokens: 5,
+    categories: { 'injected:skill': 50 },
+    usage: { input: 40, cacheRead: 10, cacheWrite: 0, output: 5 },
+    cost: { amount: 0.02, priced: true, currency: 'CNY' },
+  }))
+  store.flushNow()
+  // Keep the daily aggregates but remove every detail row: this is the
+  // "detail retention is shorter than aggregate retention" fallback.
+  fs.rmSync(path.join(store.getState().dataRoot, 'requests'), { recursive: true, force: true })
+
+  const detail = store.readSessionDetail({ from: day, to: day, sessionId: 'parent', includeDescendants: false })
+  assert.equal(detail.detailAvailable, false)
+  assert.equal(detail.detailPartial, false)
+  assert.equal(detail.detailReason, 'no-detail')
+  assert.equal(detail.session.sessionId, 'parent')
+  assert.equal(detail.summary.totals.requests, 1)
+  assert.equal(detail.summary.totals.promptTokens, 100)
+  assert.equal(detail.summary.totals.outputTokens, 10)
+  assert.equal(detail.summary.totals.totalTokens, 110)
+  assert.equal(detail.summary.totals.measuredRequests, 1)
+  assert.equal(detail.summary.totals.estimatedRequests, 0)
+  assert.deepEqual(detail.summary.bySession, [detail.session])
+  assert.deepEqual(detail.summary.cost, detail.session.cost)
+  assert.deepEqual(detail.summary.cache, {
+    input: 80,
+    read: 20,
+    write: 0,
+    hitRate: Math.round(20 / 100 * 10000) / 10000,
+  })
+  assert.deepEqual(detail.summary.byPurpose, {})
+  assert.deepEqual(detail.summary.byCategory, {})
+  assert.deepEqual(detail.summary.byCategoryGroup, {})
+  assert.deepEqual(detail.summary.byToolGroup, {})
+  assert.deepEqual(detail.summary.byModel, [])
+  assert.deepEqual(detail.summary.byDay, [])
+  assert.deepEqual(detail.summary.totals.costByCurrency, {
+    CNY: { amount: 0.01, priced: true, unpricedRequests: 0 },
+  })
+  assert.deepEqual(detail.webApi.bySession, [])
+  assert.deepEqual(detail.webApi.cost, { amount: 0, currency: 'CNY', priced: false })
+
+  // The descendant cards are synthesized from every selected row.
+  const subtree = store.readSessionDetail({ from: day, to: day, sessionId: 'parent', includeDescendants: true })
+  assert.equal(subtree.detailAvailable, false)
+  assert.equal(subtree.detailReason, 'no-detail')
+  assert.equal(subtree.summary.totals.requests, 2)
+  assert.equal(subtree.summary.totals.promptTokens, 150)
+  assert.equal(subtree.summary.totals.totalTokens, 165)
+  assert.equal(subtree.summary.bySession.length, 2)
+  assert.deepEqual(subtree.summary.cache, { input: 120, read: 30, write: 0, hitRate: 0.2 })
+  assert.deepEqual(subtree.summary.cost, { amount: 0.03, currency: 'CNY', priced: true, unpricedRequests: 0 })
+  store.dispose()
+})
+
+test('readSessionDetail flags partial detail and counts only retained rows', (t) => {
+  const home = tempHome(t)
+  const store = createStore({ config: makeConfig(), homeDir: home, profile: 'test' })
+  const today = dayKey(Date.now())
+  const day1 = shiftDays(today, -2)
+  const day2 = shiftDays(today, -1)
+  const at = day => new Date(`${day}T10:00:00`).getTime()
+  store.append(makeRecord({ id: 's1a', ts: at(day1), sessionId: 's1', promptTokens: 100, outputTokens: 10, cost: { amount: 0.01, priced: true, currency: 'CNY' } }))
+  store.append(makeRecord({ id: 's1b', ts: at(day2), sessionId: 's1', promptTokens: 50, outputTokens: 5, cost: { amount: 0.02, priced: true, currency: 'CNY' } }))
+  store.flushNow()
+  // Lose the newest day's detail while its daily aggregate remains.
+  fs.rmSync(path.join(store.getState().dataRoot, 'requests', `${day2}.jsonl`), { force: true })
+
+  assert.equal(store.readSummary({ from: day1, to: day2 }).bySession[0].requests, 2)
+  const detail = store.readSessionDetail({ from: day1, to: day2, sessionId: 's1', includeDescendants: false })
+  assert.equal(detail.detailAvailable, true)
+  assert.equal(detail.detailPartial, true)
+  assert.equal(detail.detailReason, 'partial-detail')
+  assert.equal(detail.summary.totals.requests, 1)
+  assert.equal(detail.summary.totals.promptTokens, 100)
+  assert.deepEqual(detail.summary.byDay.map(row => row.day), [day1])
+  assert.deepEqual(detail.summary.bySession.map(row => row.requests), [1])
+  store.dispose()
+})
+
+test('readSessionDetail includes queued records so the drill-down stays live', (t) => {
+  const home = tempHome(t)
+  const store = createStore({ config: makeConfig(), homeDir: home, profile: 'test' })
+  const day = dayKey(Date.now())
+  const now = Date.now()
+  store.append(makeRecord({
+    id: 'saved',
+    ts: now - 1000,
+    sessionId: 'parent',
+    promptTokens: 100,
+    outputTokens: 10,
+    cost: { amount: 0.01, priced: true, currency: 'CNY' },
+  }))
+  store.flushNow()
+  store.append(makeRecord({
+    id: 'queued',
+    ts: now,
+    sessionId: 'child',
+    parentSessionId: 'parent',
+    delegationDepth: 1,
+    promptTokens: 40,
+    outputTokens: 4,
+    cost: { amount: 0.02, priced: true, currency: 'CNY' },
+  }))
+  assert.equal(store.getState().pending, 1)
+
+  const detail = store.readSessionDetail({ from: day, to: day, sessionId: 'parent', includeDescendants: true })
+  assert.equal(detail.detailAvailable, true)
+  assert.equal(detail.detailPartial, false)
+  assert.equal(detail.detailReason, null)
+  assert.equal(detail.summary.totals.requests, 2)
+  assert.equal(detail.summary.totals.promptTokens, 140)
+  assert.ok(detail.summary.bySession.some(row => row.sessionId === 'child'))
+  assert.equal(detail.summary.byDay[0].requests, 2)
+  assert.equal(detail.summary.cost.amount, 0.03)
+  store.dispose()
+})
+
+test('readSessionDetail returns zeroed cards for an unknown session', (t) => {
+  const home = tempHome(t)
+  const store = createStore({ config: makeConfig(), homeDir: home, profile: 'test' })
+  const day = dayKey(Date.now())
+  store.append(makeRecord({ id: 'r1', ts: Date.now(), sessionId: 'known' }))
+  store.flushNow()
+
+  const detail = store.readSessionDetail({ from: day, to: day, sessionId: 'ghost' })
+  assert.equal(detail.sessionId, 'ghost')
+  assert.equal(detail.includeDescendants, true)
+  assert.equal(detail.detailAvailable, false)
+  assert.equal(detail.detailPartial, false)
+  assert.equal(detail.detailReason, 'session-not-found')
+  assert.equal(detail.session, null)
+  assert.deepEqual(detail.children, [])
+  assert.deepEqual(detail.sessionIds, ['ghost'])
+  assert.equal(detail.summary.totals.requests, 0)
+  assert.deepEqual(detail.summary.bySession, [])
+  assert.deepEqual(detail.summary.byPurpose, {})
+  assert.deepEqual(detail.summary.byModel, [])
+  assert.deepEqual(detail.summary.byDay, [])
+  assert.deepEqual(detail.summary.cost, { amount: 0, currency: 'CNY', priced: false, unpricedRequests: 0 })
+  assert.deepEqual(detail.webApi.calls, { ok: 0, failed: 0, total: 0 })
+  assert.deepEqual(detail.webApi.bySession, [])
+  assert.deepEqual(detail.webApi.cost, { amount: 0, currency: 'CNY', priced: false })
+  store.dispose()
+})
+
+test('readSessionDetail survives a parent/child cycle and a self-parent row', (t) => {
+  const home = tempHome(t)
+  const store = createStore({ config: makeConfig(), homeDir: home, profile: 'test' })
+  const day = dayKey(Date.now())
+  const at = Date.now()
+  const row = (id, sessionId, parentSessionId) => makeRecord({ id, ts: at, sessionId, parentSessionId })
+  // A <-> B is a cycle; D hangs off A; C points at itself.
+  store.append(row('a', 'A', 'B'))
+  store.append(row('b', 'B', 'A'))
+  store.append(row('d', 'D', 'A'))
+  store.append(row('c', 'C', 'C'))
+  store.flushNow()
+
+  const cycle = store.readSessionDetail({ from: day, to: day, sessionId: 'A', includeDescendants: true })
+  assert.equal(cycle.detailAvailable, true)
+  assert.deepEqual([...cycle.sessionIds].sort(), ['A', 'B', 'D'])
+  assert.deepEqual(cycle.children.map(child => child.sessionId), ['B', 'D'])
+
+  const selfParent = store.readSessionDetail({ from: day, to: day, sessionId: 'C', includeDescendants: true })
+  assert.deepEqual(selfParent.sessionIds, ['C'])
+  assert.deepEqual(selfParent.children, [])
+  store.dispose()
+})
+
+test('readRequests filters by a sessionIds set without changing sessionId semantics', (t) => {
+  const home = tempHome(t)
+  const store = createStore({ config: makeConfig(), homeDir: home, profile: 'test' })
+  const today = dayKey(Date.now())
+  const earlier = shiftDays(today, -1)
+  const at = (day, minute) => new Date(`${day}T09:${String(minute).padStart(2, '0')}:00`).getTime()
+  const records = [
+    makeRecord({ id: 'a1', ts: at(earlier, 0), sessionId: 'alpha', purpose: 'chat' }),
+    makeRecord({ id: 'a2', ts: at(earlier, 1), sessionId: 'alpha', purpose: 'auto-review' }),
+    makeRecord({ id: 'b1', ts: at(today, 0), sessionId: 'beta', purpose: 'chat' }),
+    makeRecord({ id: 'g1', ts: at(today, 1), sessionId: 'gamma', purpose: 'chat' }),
+  ]
+  const noSession = makeRecord({ id: 'n1', ts: at(today, 2), sessionId: 'removed' })
+  delete noSession.sessionId
+  for (const record of [...records, noSession]) assert.equal(store.append(record), true)
+  store.flushNow()
+
+  const set = store.readRequests({ from: earlier, to: today, sessionIds: ['alpha', 'beta'] })
+  assert.equal(set.total, 3)
+  assert.deepEqual(set.items.map(item => item.id).sort(), ['a1', 'a2', 'b1'])
+
+  const combined = store.readRequests({ from: earlier, to: today, sessionIds: ['alpha', 'beta'], purpose: 'chat' })
+  assert.equal(combined.total, 2)
+  assert.deepEqual(combined.items.map(item => item.id).sort(), ['a1', 'b1'])
+
+  const paged = store.readRequests({ from: earlier, to: today, sessionIds: ['alpha', 'beta'], limit: 1, offset: 1 })
+  assert.equal(paged.total, 3)
+  assert.equal(paged.items.length, 1)
+
+  // `sessionId` and `sessionIds` intersect; disjoint filters match nothing.
+  assert.equal(store.readRequests({ from: earlier, to: today, sessionId: 'alpha', sessionIds: ['beta'] }).total, 0)
+  assert.equal(store.readRequests({ from: earlier, to: today, sessionId: 'alpha', sessionIds: ['alpha'] }).total, 2)
+  assert.equal(store.readRequests({ from: earlier, to: today, sessionIds: ['missing'] }).total, 0)
+
+  // The store defensively ignores an empty/non-array set filter; the RPC
+  // endpoint rejects both before they reach the store.
+  assert.equal(store.readRequests({ from: earlier, to: today, sessionIds: [] }).total, 5)
+  assert.equal(store.readRequests({ from: earlier, to: today, sessionIds: 'alpha' }).total, 5)
+  assert.equal(store.readRequests({ from: earlier, to: today, sessionIds: [''] }).total, 5)
+  store.dispose()
+})
+test('readSessionDetail reads web API counters beyond the 100-row session cap', (t) => {
+  const home = tempHome(t)
+  const config = makeConfig()
+  const day = dayKey(Date.now())
+  const ts = Date.now()
+  const store = createStore({ config, homeDir: home, profile: 'test' })
+  const sessions = {}
+  for (let index = 0; index < 101; index += 1) {
+    const sessionId = `s${String(index).padStart(3, '0')}`
+    sessions[sessionId] = { search: { ok: 1, failed: 0 }, fetch: { ok: 0, failed: 0 } }
+    store.append(makeRecord({ id: `call-${sessionId}`, ts, sessionId, categories: { user: 1 } }))
+  }
+  writeWebApiFile(store.getState().dataRoot, day, { search: { ok: 101 }, sessions })
+
+  const detail = store.readSessionDetail({ from: day, to: day, sessionId: 's100', includeDescendants: false })
+  assert.deepEqual(detail.webApi.search, { ok: 1, failed: 0, total: 1 })
+  assert.deepEqual(detail.webApi.calls, { ok: 1, failed: 0, total: 1 })
+  assert.deepEqual(detail.webApi.bySession.map(row => row.sessionId), ['s100'])
+  store.dispose()
+})

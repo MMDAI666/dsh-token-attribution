@@ -11,8 +11,11 @@
  * M2.6 keeps one sidebar entry and splits the page into seven internal tabs
  * (Overview / Sessions / Models / Sources / Search / Details / Settings); the
  * gear switches to the inline Settings tab, which edits every Config field
- * through `config.set`. React is the only module import; every style comes from
- * the `--dsw-alias-*` theme tokens (SVG artwork uses `currentColor`).
+ * through `config.set`. M3 adds an in-place single-session drill-down on the
+ * Sessions tab only (no extra tab or URL routing): clicking a session title
+ * swaps the tree for `SessionDetailView`, and Back restores it. React is the
+ * only module import; every style comes from the `--dsw-alias-*` theme tokens
+ * (SVG artwork uses `currentColor`).
  */
 
 window.__ModuleLoader__.load({
@@ -1474,33 +1477,45 @@ window.__ModuleLoader__.load({
       if (!Array.isArray(raw)) return []
       const sessions = []
       for (const entry of raw) {
-        if (!isPlainObject(entry)) continue
-        const hasSplit = typeof entry.promptTokens === 'number' || typeof entry.outputTokens === 'number'
-        const promptTokens = hasSplit ? tokenNumber(entry.promptTokens) : null
-        const outputTokens = hasSplit ? tokenNumber(entry.outputTokens) : null
-        const tokens = tokenNumber(entry.tokens) || (hasSplit ? promptTokens + outputTokens : 0)
-        if (tokens === 0 && countNumber(entry.requests) === 0) continue
-        const rawCache = isPlainObject(entry.cache) ? entry.cache : {}
-        sessions.push({
-          sessionId: typeof entry.sessionId === 'string' ? entry.sessionId : '',
-          parentSessionId: typeof entry.parentSessionId === 'string' && entry.parentSessionId.length > 0
-            ? entry.parentSessionId
-            : null,
-          depth: countNumber(entry.depth),
-          requests: countNumber(entry.requests),
-          promptTokens,
-          outputTokens,
-          tokens,
-          cache: {
-            input: tokenNumber(rawCache.input),
-            read: tokenNumber(rawCache.read),
-            write: tokenNumber(rawCache.write),
-          },
-          cost: normalizeCost(entry.cost, entry.currency),
-        })
+        const row = normalizeSessionRow(entry)
+        if (row !== null) sessions.push(row)
       }
       sessions.sort((left, right) => right.tokens - left.tokens)
       return sessions
+    }
+
+    /**
+     * Normalize one Host `bySession` row (or the M3 `sessionDetail.session`
+     * echo). The same shape feeds the tree, the drill-down header, and the
+     * direct-child list, so every field is coerced once here.
+     * @param {unknown} entry - raw session row.
+     * @returns {object|null} normalized row, or null for a malformed/empty row.
+     */
+    function normalizeSessionRow(entry) {
+      if (!isPlainObject(entry)) return null
+      const hasSplit = typeof entry.promptTokens === 'number' || typeof entry.outputTokens === 'number'
+      const promptTokens = hasSplit ? tokenNumber(entry.promptTokens) : null
+      const outputTokens = hasSplit ? tokenNumber(entry.outputTokens) : null
+      const tokens = tokenNumber(entry.tokens) || (hasSplit ? promptTokens + outputTokens : 0)
+      if (tokens === 0 && countNumber(entry.requests) === 0) return null
+      const rawCache = isPlainObject(entry.cache) ? entry.cache : {}
+      return {
+        sessionId: typeof entry.sessionId === 'string' ? entry.sessionId : '',
+        parentSessionId: typeof entry.parentSessionId === 'string' && entry.parentSessionId.length > 0
+          ? entry.parentSessionId
+          : null,
+        depth: countNumber(entry.depth),
+        requests: countNumber(entry.requests),
+        promptTokens,
+        outputTokens,
+        tokens,
+        cache: {
+          input: tokenNumber(rawCache.input),
+          read: tokenNumber(rawCache.read),
+          write: tokenNumber(rawCache.write),
+        },
+        cost: normalizeCost(entry.cost, entry.currency),
+      }
     }
 
     /**
@@ -2241,6 +2256,401 @@ window.__ModuleLoader__.load({
           costDetailIncomplete: rawData.costDetailIncomplete === true,
         },
       }
+    }
+
+    // ---------------------------------------------------------------------
+    // M3 — single-session drill-down (normalizers, payloads, drill state)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Normalize a list of session ids: drop non-strings, trim, dedupe, keep
+     * order. The Host caps `summary.bySession` at 500 rows; the same cap keeps
+     * a malformed `sessionIds` echo from growing an RPC payload without bound.
+     * @param {unknown} raw - candidate list.
+     * @param {number} [limit] - maximum ids kept.
+     * @returns {Array<string>} normalized ids.
+     */
+    function normalizeSessionIdList(raw, limit = 1000) {
+      if (!Array.isArray(raw)) return []
+      const max = Number.isInteger(limit) && limit > 0 ? limit : 1000
+      const seen = new Set()
+      const ids = []
+      for (const entry of raw) {
+        if (typeof entry !== 'string') continue
+        const id = entry.trim()
+        if (id === '' || seen.has(id)) continue
+        seen.add(id)
+        ids.push(id)
+        if (ids.length >= max) break
+      }
+      return ids
+    }
+
+    /**
+     * Derive a `summary.webApi`-shaped block restricted to one session set.
+     *
+     * `summary.webApi` is range-wide, so a drill-down must never copy its
+     * totals: they would claim calls from sessions the user did not select.
+     * The per-session rows are filtered and re-summed here instead; the
+     * synthetic `unattributed` remainder is always zero (it is a range-level
+     * reconciliation row, not a session's data).
+     * @param {unknown} raw - range-wide `summary.webApi`.
+     * @param {Array<string>} sessionIds - selected session ids (including subtree).
+     * @returns {object} normalized Web API block for the session set.
+     */
+    function webApiForSessions(raw, sessionIds) {
+      const normalized = normalizeWebApi(raw)
+      const ids = normalizeSessionIdList(sessionIds)
+      const selected = new Set(ids)
+      const rows = selected.size > 0
+        ? normalized.bySession.filter(row => selected.has(row.sessionId))
+        : normalized.bySession
+      const search = { ok: 0, failed: 0, total: 0 }
+      const fetch = { ok: 0, failed: 0, total: 0 }
+      const calls = { ok: 0, failed: 0, total: 0 }
+      let cost = null
+      for (const row of rows) {
+        search.ok += row.search.ok
+        search.failed += row.search.failed
+        search.total += row.search.total
+        fetch.ok += row.fetch.ok
+        fetch.failed += row.fetch.failed
+        fetch.total += row.fetch.total
+        calls.ok += row.calls.ok
+        calls.failed += row.calls.failed
+        calls.total += row.calls.total
+        if (row.cost !== null) cost = mergeSubtreeCost(cost, row.cost)
+      }
+      return {
+        search,
+        fetch,
+        calls,
+        cost: cost === null
+          ? { amount: 0, currency: DEFAULT_WEB_API_PRICING.currency, priced: false }
+          : { amount: cost.amount, currency: cost.currency, priced: cost.priced === true },
+        bySession: rows,
+        unattributed: normalizeWebApiUnattributed(null),
+      }
+    }
+
+    /**
+     * Build a minimal normalized summary from one session row, used only when
+     * the Host echoes a `session` row without a `summary` block.
+     * @param {object} session - normalized session row.
+     * @returns {object} normalized summary.
+     */
+    function summaryFromSessionRow(session) {
+      return normalizeSummary({
+        totals: {
+          promptTokens: session.promptTokens ?? 0,
+          outputTokens: session.outputTokens ?? 0,
+          totalTokens: session.tokens,
+          requests: session.requests,
+        },
+        cache: session.cache,
+        cost: session.cost ?? undefined,
+        bySession: [session],
+      })
+    }
+
+    /**
+     * Normalize the M3 `sessionDetail` payload.
+     *
+     * The Host filters `summary`, `children`, `sessionIds` and `webApi` to the
+     * selected session set (subtree included when requested). Defensive rules:
+     * - `detailAvailable` defaults to true; only an explicit `false` selects the
+     *   retained-aggregate fallback (the pre-M3 Host never sends the field).
+     * - a missing `summary` is synthesized from the `session` row so the cards
+     *   still render.
+     * - a missing `webApi` block is derived from `summary.webApi.bySession`
+     *   filtered to the session set, never from range-wide totals.
+     * @param {unknown} raw - raw `sessionDetail` RPC value.
+     * @returns {object} normalized session detail.
+     */
+    function normalizeSessionDetail(raw) {
+      const value = isPlainObject(raw) ? raw : {}
+      const session = normalizeSessionRow(value.session)
+      const children = normalizeSessions(value.children)
+      const requestedId = typeof value.sessionId === 'string' ? value.sessionId.trim() : ''
+      const sessionId = requestedId !== ''
+        ? requestedId
+        : session !== null && session.sessionId !== '' ? session.sessionId : ''
+      const hostSessionIds = normalizeSessionIdList(value.sessionIds)
+      let sessionIds = hostSessionIds.slice()
+      if (sessionIds.length === 0) {
+        const derived = []
+        if (sessionId !== '') derived.push(sessionId)
+        if (session !== null) derived.push(session.sessionId)
+        for (const child of children) derived.push(child.sessionId)
+        sessionIds = normalizeSessionIdList(derived)
+      }
+      const hasSummary = isPlainObject(value.summary)
+      const summary = hasSummary
+        ? normalizeSummary(value.summary)
+        : session !== null ? summaryFromSessionRow(session) : normalizeSummary(null)
+      const summaryWebApi = hasSummary && isPlainObject(value.summary.webApi) ? value.summary.webApi : null
+      let webApi
+      if (isPlainObject(value.webApi)) {
+        webApi = normalizeWebApi(value.webApi)
+        // Only filter against the Host-echoed list; a derived list may miss
+        // deeper descendants and would otherwise hide their Web API rows.
+        if (hostSessionIds.length > 0) {
+          const selected = new Set(hostSessionIds)
+          webApi.bySession = webApi.bySession.filter(row => selected.has(row.sessionId))
+        }
+      } else if (summaryWebApi !== null) {
+        webApi = webApiForSessions(summaryWebApi, sessionIds)
+      } else {
+        webApi = normalizeWebApi(null)
+      }
+      // The Host-level unattributed remainder is range-level reconciliation and
+      // must never show up in a single-session drill-down.
+      webApi.unattributed = normalizeWebApiUnattributed(null)
+      // Prefer the detail range; fall back to the echoed summary range when a
+      // Host sends only the named label here.
+      const range = normalizeRange(value.range)
+      if (range.from === '' && range.to === '') {
+        range.from = summary.range.from
+        range.to = summary.range.to
+        range.label = summary.range.label || range.label
+      }
+      return {
+        generatedAt: numberOr(value.generatedAt, 0),
+        range,
+        sessionId,
+        includeDescendants: value.includeDescendants !== false,
+        detailAvailable: value.detailAvailable !== false,
+        detailPartial: value.detailPartial === true,
+        detailReason: typeof value.detailReason === 'string' && value.detailReason.trim().length > 0
+          ? value.detailReason.trim()
+          : null,
+        session,
+        children,
+        sessionIds,
+        summary,
+        webApi,
+      }
+    }
+
+    /**
+     * Whether a normalized session detail names a session that no longer has
+     * any rows in the selected range.
+     * @param {object|null} detail - normalized session detail.
+     * @returns {boolean} true when the selection vanished.
+     */
+    function sessionDetailEmpty(detail) {
+      if (!isPlainObject(detail)) return true
+      // A vanished session can still have surviving child rows (for example a
+      // narrowed range drops the parent). The parent itself is gone, so show
+      // the missing state and let the children stay navigable; do not paint
+      // zeroed parent cards or the 30-day fallback note.
+      return detail.session === null || detail.detailReason === 'session-not-found'
+    }
+
+    /**
+     * Initial state for the single-session drill-down (Sessions tab only).
+     * @param {string} [rangeKey] - Host-resolved range key (`from|to`).
+     * @returns {object} drill state.
+     */
+    function createDrillState(rangeKey = '') {
+      return {
+        sessionId: null,
+        includeDescendants: true,
+        status: 'idle',
+        data: null,
+        error: null,
+        rangeKey: typeof rangeKey === 'string' ? rangeKey : '',
+        lastSessionId: '',
+      }
+    }
+
+    /**
+     * Pure transitions for the drill-down state.
+     *
+     * `open` selects a session (defaults to subtree mode) and shows the loading
+     * state; `toggle` flips the subtree scope and refetches; `loaded` records
+     * the response and detects a vanished session; `range` clears stale data
+     * before the refetch for a new range; `error` clears the selection (the
+     * panel returns to the tree and keeps `lastSessionId` so the warning can
+     * retry); `close` is the Back action.
+     * @param {unknown} state - current drill state.
+     * @param {object} action - transition action.
+     * @returns {object} next drill state.
+     */
+    function drillReducer(state, action) {
+      const current = isPlainObject(state) ? state : createDrillState()
+      const type = typeof action?.type === 'string' ? action.type : ''
+      if (type === 'open') {
+        const sessionId = typeof action.sessionId === 'string' ? action.sessionId.trim() : ''
+        if (sessionId === '') return current
+        return {
+          ...createDrillState(current.rangeKey),
+          sessionId,
+          includeDescendants: action.includeDescendants !== false,
+          status: 'loading',
+          lastSessionId: sessionId,
+        }
+      }
+      if (type === 'toggle') {
+        if (current.sessionId === null) return current
+        return {
+          ...current,
+          includeDescendants: action.includeDescendants === true,
+          status: 'loading',
+          data: null,
+          error: null,
+        }
+      }
+      if (type === 'refresh') {
+        if (current.sessionId === null) return current
+        const status = current.data === null
+          ? 'loading'
+          : current.status === 'empty' ? 'empty' : 'ready'
+        return { ...current, status, error: null }
+      }
+      if (type === 'loaded') {
+        const raw = isPlainObject(action.data) ? action.data : null
+        const data = raw === null
+          ? null
+          : isPlainObject(raw.summary) && Array.isArray(raw.summary.byPurposeEntries)
+            ? raw
+            : normalizeSessionDetail(raw)
+        if (current.sessionId === null || data === null) return current
+        const rangeKey = isPlainObject(data.range) && (data.range.from !== '' || data.range.to !== '')
+          ? detailsRangeKeyFromRange(data.range)
+          : current.rangeKey
+        return {
+          ...current,
+          status: sessionDetailEmpty(data) ? 'empty' : 'ready',
+          data,
+          error: null,
+          rangeKey,
+        }
+      }
+      if (type === 'range') {
+        const rangeKey = typeof action.rangeKey === 'string' ? action.rangeKey : current.rangeKey
+        if (current.sessionId === null) {
+          return { ...current, rangeKey, error: null }
+        }
+        return { ...current, rangeKey, status: 'loading', data: null, error: null }
+      }
+      if (type === 'error') {
+        return {
+          ...createDrillState(current.rangeKey),
+          status: 'idle',
+          error: isPlainObject(action.error) ? action.error : { code: 'unknown', message: '', details: {} },
+          lastSessionId: current.sessionId ?? current.lastSessionId,
+        }
+      }
+      if (type === 'close') return createDrillState(current.rangeKey)
+      return current
+    }
+
+    /**
+     * Hydrate a drill state from the headless-test `initialDrill` prop (the
+     * same escape hatch as `initialTab`): `{sessionId, includeDescendants, data}`
+     * where `data` is a raw `sessionDetail` payload.
+     * @param {unknown} raw - candidate initial drill.
+     * @returns {object} drill state.
+     */
+    function initialDrillState(raw) {
+      if (!isPlainObject(raw)) return createDrillState()
+      const data = isPlainObject(raw.data) ? normalizeSessionDetail(raw.data) : null
+      const requested = typeof raw.sessionId === 'string' ? raw.sessionId.trim() : ''
+      const sessionId = requested !== ''
+        ? requested
+        : data !== null && data.sessionId !== '' ? data.sessionId : data?.session?.sessionId ?? ''
+      if (typeof sessionId !== 'string' || sessionId === '') return createDrillState()
+      const status = data === null ? 'loading' : sessionDetailEmpty(data) ? 'empty' : 'ready'
+      return {
+        ...createDrillState(data === null ? '' : detailsRangeKeyFromRange(data.range)),
+        sessionId,
+        includeDescendants: raw.includeDescendants !== false,
+        status,
+        data,
+        lastSessionId: sessionId,
+      }
+    }
+
+    /**
+     * Build the M3 `sessionDetail` RPC payload.
+     * @param {unknown} rangeValue - named range (`today`/`7d`/`30d`).
+     * @param {{sessionId?: unknown, includeDescendants?: unknown}} [options] - selection.
+     * @returns {{range: string, sessionId: string, includeDescendants: boolean}} payload.
+     */
+    function sessionDetailPayload(rangeValue, options) {
+      const opts = isPlainObject(options) ? options : {}
+      const candidate = typeof rangeValue === 'string'
+        ? rangeValue
+        : isPlainObject(rangeValue) && typeof rangeValue.label === 'string' ? rangeValue.label : ''
+      const range = RANGES.includes(candidate) ? candidate : 'today'
+      return {
+        range,
+        sessionId: typeof opts.sessionId === 'string' ? opts.sessionId.trim() : '',
+        includeDescendants: opts.includeDescendants !== false,
+      }
+    }
+
+    /**
+     * Build the `requests` RPC payload for a session detail view.
+     *
+     * In subtree mode the Host `requests` endpoint accepts the full
+     * `sessionIds` list (combined rows for the selected session set); in
+     * single-session mode (or when the Host-echoed list is missing) the legacy
+     * `sessionId` filter is used instead. `sessionIds` is never sent empty, so
+     * a Host without M3 support still sees the pre-M3 payload shape.
+     * @param {unknown} rangeValue - Host range (`{from,to}`).
+     * @param {object} [options] - paging and session selection.
+     * @returns {{from: string, to: string, limit: number, offset: number, sessionIds?: Array<string>, sessionId?: string}} payload.
+     */
+    function sessionRequestsPayload(rangeValue, options) {
+      const range = normalizeRange(rangeValue)
+      const opts = isPlainObject(options) ? options : {}
+      const limit = Number.isInteger(opts.limit) && opts.limit > 0 ? opts.limit : DETAILS_PAGE_SIZE
+      const offset = Number.isInteger(opts.offset) && opts.offset > 0 ? opts.offset : 0
+      const payload = { from: range.from, to: range.to, limit, offset }
+      const sessionIds = normalizeSessionIdList(opts.sessionIds)
+      const sessionId = typeof opts.sessionId === 'string' ? opts.sessionId.trim() : ''
+      if (opts.includeDescendants === true && sessionIds.length > 0) payload.sessionIds = sessionIds
+      else if (sessionId !== '') payload.sessionId = sessionId
+      return payload
+    }
+
+    /**
+     * Build the ancestor path (root → selected) for the drill-down breadcrumb.
+     *
+     * The rows come from the range-wide `summary.bySession`, which contains the
+     * parent links; a missing parent or a parent cycle simply ends the walk, so
+     * a stale selection still yields a usable one-item path.
+     * @param {unknown} bySession - normalized (or raw) session rows.
+     * @param {unknown} sessionId - selected session id.
+     * @param {number} [maxDepth] - safety cap for malformed parent chains.
+     * @returns {Array<{sessionId: string, parentSessionId: string|null}>} path.
+     */
+    function sessionBreadcrumb(bySession, sessionId, maxDepth = 32) {
+      const rows = Array.isArray(bySession) ? bySession : []
+      const depthCap = Number.isInteger(maxDepth) && maxDepth > 0 ? maxDepth : 32
+      const byId = new Map()
+      for (const row of rows) {
+        if (!isPlainObject(row) || typeof row.sessionId !== 'string' || row.sessionId === '') continue
+        if (!byId.has(row.sessionId)) byId.set(row.sessionId, row)
+      }
+      const path = []
+      const seen = new Set()
+      let cursor = typeof sessionId === 'string' ? sessionId : ''
+      while (cursor !== '' && !seen.has(cursor) && path.length < depthCap) {
+        seen.add(cursor)
+        const row = byId.get(cursor)
+        path.push({
+          sessionId: cursor,
+          parentSessionId: row !== undefined && typeof row.parentSessionId === 'string' && row.parentSessionId !== ''
+            ? row.parentSessionId
+            : null,
+        })
+        cursor = path[path.length - 1].parentSessionId ?? ''
+      }
+      path.reverse()
+      return path
     }
 
     /**
@@ -3292,6 +3702,35 @@ window.__ModuleLoader__.load({
         'details.progress': 'Showing {shown} of {total}',
         'details.loadedAll': 'All {total} rows loaded',
 
+        'table.sessions.open': 'Open session detail: {name}',
+        'sessionDetail.back': 'Back to sessions',
+        'sessionDetail.breadcrumb': 'Session path',
+        'sessionDetail.includeDescendants': 'Include subagents',
+        'sessionDetail.onlySession': 'This session only',
+        'sessionDetail.toggleHint': 'Totals include this session and all its descendant sessions.',
+        'sessionDetail.toggleSingleHint': 'Totals cover this session only.',
+        'sessionDetail.subtreeNote': 'Showing subtree totals',
+        'sessionDetail.singleNote': 'Showing this session only',
+        'sessionDetail.loading': 'Loading session detail…',
+        'sessionDetail.loadFailed': 'Could not load this session detail.',
+        'sessionDetail.unavailable': 'Request detail is only kept for 30 days, so attribution cannot be expanded.',
+        'sessionDetail.partial': 'Part of this range has no request detail; breakdowns cover only the retained days.',
+        'sessionDetail.missing': 'This session no longer appears in the selected range.',
+        'sessionDetail.missingHint': 'Go back to the session list and pick another session.',
+        'sessionDetail.summaryTitle': 'Session summary',
+        'sessionDetail.cardsHint': 'Totals for the selected session at the current range',
+        'sessionDetail.childrenTitle': 'Direct child sessions',
+        'sessionDetail.childrenHint': 'Subtree totals include every child; click a child to drill down.',
+        'sessionDetail.childrenHintSingle': 'Only this session is counted; children are listed separately and can be opened.',
+        'sessionDetail.childrenEmpty': 'No direct child sessions in this range',
+        'sessionDetail.child': 'Open child session: {name}',
+        'sessionDetail.crumb': 'Open ancestor session: {name}',
+        'sessionDetail.requestsTitle': 'Session requests',
+        'sessionDetail.requestsHint': 'Requests for the selected session set, {limit} per page',
+        'sessionDetail.requestsEmpty': 'No request details for this session set',
+        'sessionDetail.requestsFailed': 'Could not load the session request details.',
+        'sessionDetail.webHint': 'Search and fetch calls attributed to the selected session set.',
+
         'requests.title': 'Recent requests',
         'requests.hint': 'Range end day {date} · up to {limit} rows',
         'requests.expand': 'Show',
@@ -3723,6 +4162,35 @@ window.__ModuleLoader__.load({
         'details.failed': '请求明细加载失败。',
         'details.progress': '已显示 {shown} / {total} 条',
         'details.loadedAll': '已加载全部 {total} 条',
+
+        'table.sessions.open': '打开会话明细：{name}',
+        'sessionDetail.back': '返回会话列表',
+        'sessionDetail.breadcrumb': '会话路径',
+        'sessionDetail.includeDescendants': '含子代理',
+        'sessionDetail.onlySession': '仅本会话',
+        'sessionDetail.toggleHint': '汇总本会话及其全部子会话。',
+        'sessionDetail.toggleSingleHint': '仅统计本会话，不含子会话。',
+        'sessionDetail.subtreeNote': '当前为子树汇总',
+        'sessionDetail.singleNote': '当前仅统计本会话',
+        'sessionDetail.loading': '正在加载会话明细…',
+        'sessionDetail.loadFailed': '会话明细加载失败。',
+        'sessionDetail.unavailable': '明细仅保留 30 天，无法展开归因',
+        'sessionDetail.partial': '该范围部分日期没有明细，归因仅覆盖仍保留明细的日期。',
+        'sessionDetail.missing': '该会话已不在所选范围内。',
+        'sessionDetail.missingHint': '返回会话列表并选择其他会话。',
+        'sessionDetail.summaryTitle': '本会话摘要',
+        'sessionDetail.cardsHint': '当前范围下所选会话的汇总',
+        'sessionDetail.childrenTitle': '直接子会话',
+        'sessionDetail.childrenHint': '子树汇总含全部子会话；点击子会话可继续下钻。',
+        'sessionDetail.childrenHintSingle': '仅统计本会话；子会话单独列出，可点击继续下钻。',
+        'sessionDetail.childrenEmpty': '该范围内没有直接子会话',
+        'sessionDetail.child': '打开子会话：{name}',
+        'sessionDetail.crumb': '打开上级会话：{name}',
+        'sessionDetail.requestsTitle': '本会话请求明细',
+        'sessionDetail.requestsHint': '所选会话集合的逐条请求，每页 {limit} 条',
+        'sessionDetail.requestsEmpty': '所选会话集合暂无请求明细',
+        'sessionDetail.requestsFailed': '本会话请求明细加载失败。',
+        'sessionDetail.webHint': '所选会话集合的搜索 / 抓取调用。',
 
         'requests.title': '最近请求',
         'requests.hint': '范围结束日 {date} · 最多 {limit} 条',
@@ -4596,6 +5064,9 @@ window.__ModuleLoader__.load({
       const rows = limit > 0 ? allRows.slice(0, limit) : allRows
       const compactTop = limit > 0
       const toggle = typeof props.onToggle === 'function' ? props.onToggle : () => {}
+      // M3: only the Sessions tab wires `onOpen`; Overview's Top-N table stays
+      // read-only, and without the prop the title cell keeps its pre-M3 markup.
+      const openSession = typeof props.onOpen === 'function' ? props.onOpen : null
       const costLabels = { mixed: t('table.costMixed'), unpriced: t('card.valueUnavailable') }
       const padding = '6px 8px'
       const headStyle = {
@@ -4635,6 +5106,32 @@ window.__ModuleLoader__.load({
         alignItems: 'center',
         gap: 2,
         flex: 'none',
+      }
+      const openButtonStyle = {
+        font: 'inherit',
+        fontSize: 12,
+        lineHeight: '18px',
+        color: COLORS.text,
+        background: 'none',
+        border: 'none',
+        padding: 0,
+        margin: 0,
+        cursor: 'pointer',
+        textAlign: 'left',
+        display: 'inline-flex',
+        alignItems: 'center',
+        minWidth: 0,
+        maxWidth: 320,
+        overflow: 'hidden',
+      }
+      const titleStyle = {
+        fontSize: 12,
+        color: COLORS.text,
+        minWidth: 0,
+        maxWidth: 320,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
       }
       let body
       if (rows.length === 0) {
@@ -4695,26 +5192,41 @@ window.__ModuleLoader__.load({
                   h('span', { key: 'count', style: { fontVariantNumeric: 'tabular-nums' } }, String(node.children.length)),
                 ])
                 : h('span', { key: 'spacer', 'aria-hidden': 'true', style: { display: 'inline-block', width: 18, flex: 'none' } }),
-              hasTitle
-                ? h('span', {
-                  key: 'title',
+              openSession !== null && node.sessionId !== ''
+                ? h('button', {
+                  key: 'open',
+                  type: 'button',
+                  'data-dsh-part': 'session-open',
+                  'data-session-id': node.sessionId,
+                  'data-session-key': node.key,
+                  'aria-label': t('table.sessions.open', { name: sessionLabel }),
                   title: sessionTooltip,
-                  'data-dsh-part': 'session-title',
-                  style: {
-                    fontSize: 12,
-                    color: COLORS.text,
-                    minWidth: 0,
-                    maxWidth: 320,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                  },
-                }, sessionLabel)
-                : h('code', {
-                  key: 'id',
-                  title: sessionTooltip,
-                  style: { fontFamily: MONO_STACK, fontSize: 11, color: COLORS.text },
-                }, sessionLabel),
+                  onClick: () => openSession(node.sessionId),
+                  style: openButtonStyle,
+                }, hasTitle
+                  ? h('span', {
+                    key: 'title',
+                    title: sessionTooltip,
+                    'data-dsh-part': 'session-title',
+                    style: titleStyle,
+                  }, sessionLabel)
+                  : h('code', {
+                    key: 'id',
+                    title: sessionTooltip,
+                    style: { fontFamily: MONO_STACK, fontSize: 11, color: COLORS.text },
+                  }, sessionLabel))
+                : hasTitle
+                  ? h('span', {
+                    key: 'title',
+                    title: sessionTooltip,
+                    'data-dsh-part': 'session-title',
+                    style: titleStyle,
+                  }, sessionLabel)
+                  : h('code', {
+                    key: 'id',
+                    title: sessionTooltip,
+                    style: { fontFamily: MONO_STACK, fontSize: 11, color: COLORS.text },
+                  }, sessionLabel),
               node.depth > 0 ? h('span', { key: 'depth', style: badgeStyle }, t('table.sessions.subagent')) : null,
             ])
             return h('tr', { key: node.key, 'data-session-row': node.key }, [
@@ -4942,6 +5454,60 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * One page of request rows (shared by the Details tab and the M3 session
+     * drill-down). Pure render; the caller owns fetching and paging state.
+     * @param {object} props - `{items, sessionTitles, t, part}`.
+     * @returns {object} React element.
+     */
+    function RequestRows(props) {
+      const t = props.t
+      const items = Array.isArray(props.items) ? props.items : []
+      const sessionTitles = isPlainObject(props.sessionTitles) ? props.sessionTitles : null
+      const padding = '6px 8px'
+      const headStyle = {
+        padding,
+        color: COLORS.muted,
+        fontWeight: 500,
+        borderBottom: `0.5px solid ${COLORS.borderStrong}`,
+        whiteSpace: 'nowrap',
+      }
+      const cellStyle = {
+        padding,
+        color: COLORS.text,
+        borderBottom: `0.5px solid ${COLORS.border}`,
+        whiteSpace: 'nowrap',
+        verticalAlign: 'top',
+      }
+      const rightCell = { ...cellStyle, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
+      return h('div', {
+        key: 'table',
+        style: { width: '100%', overflowX: 'auto', minWidth: 0 },
+      }, h('table', {
+        'data-dsh-part': typeof props.part === 'string' && props.part.length > 0 ? props.part : 'details-table',
+        style: { width: '100%', borderCollapse: 'collapse', fontSize: 11, lineHeight: '18px' },
+      }, [
+        h('thead', { key: 'thead' }, h('tr', null, [
+          h('th', { key: 'time', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('requests.time')),
+          h('th', { key: 'session', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('details.session')),
+          h('th', { key: 'purpose', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('requests.purpose')),
+          h('th', { key: 'prompt', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.prompt')),
+          h('th', { key: 'output', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.output')),
+          h('th', { key: 'cacheRead', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.cacheRead')),
+          h('th', { key: 'cost', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.cost')),
+        ])),
+        h('tbody', { key: 'tbody' }, items.map(row => h('tr', { key: row.key }, [
+          h('td', { key: 'time', style: { ...cellStyle, textAlign: 'left', fontVariantNumeric: 'tabular-nums' } }, formatTime(row.ts)),
+          h('td', { key: 'session', style: { ...cellStyle, textAlign: 'left' } }, requestSessionCell(row, sessionTitles, t)),
+          h('td', { key: 'purpose', style: { ...cellStyle, textAlign: 'left' } }, purposeLabel(t, row.purpose)),
+          h('td', { key: 'prompt', style: rightCell }, tokenCell(row.promptTokens)),
+          h('td', { key: 'output', style: rightCell }, tokenCell(row.outputTokens)),
+          h('td', { key: 'cacheRead', style: rightCell }, tokenCell(row.cacheReadTokens)),
+          h('td', { key: 'cost', style: rightCell }, formatCostCell(row.cost, undefined, { mixed: t('table.costMixed') })),
+        ]))),
+      ]))
+    }
+
+    /**
      * Details tab: paginated request rows over the selected range.
      *
      * Filters are purpose and session (both "all" by default); the page size is
@@ -4965,22 +5531,6 @@ window.__ModuleLoader__.load({
         options.unshift({ value: sessionId, label: shortId(sessionId, 12), title: '' })
       }
       const purposeOptions = [DETAILS_FILTER_ALL, ...DETAILS_PURPOSES]
-      const padding = '6px 8px'
-      const headStyle = {
-        padding,
-        color: COLORS.muted,
-        fontWeight: 500,
-        borderBottom: `0.5px solid ${COLORS.borderStrong}`,
-        whiteSpace: 'nowrap',
-      }
-      const cellStyle = {
-        padding,
-        color: COLORS.text,
-        borderBottom: `0.5px solid ${COLORS.border}`,
-        whiteSpace: 'nowrap',
-        verticalAlign: 'top',
-      }
-      const rightCell = { ...cellStyle, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
       const selectStyle = { ...INPUT_STYLE, width: 'auto', minWidth: 120, maxWidth: 320 }
       const filterRow = h('div', {
         key: 'filters',
@@ -5054,32 +5604,7 @@ window.__ModuleLoader__.load({
           notice = h('p', { key: 'empty', style: { ...HINT_STYLE, margin: 0 } }, t('details.empty'))
         }
       } else {
-        table = h('div', {
-          key: 'table',
-          style: { width: '100%', overflowX: 'auto', minWidth: 0 },
-        }, h('table', {
-          'data-dsh-part': 'details-table',
-          style: { width: '100%', borderCollapse: 'collapse', fontSize: 11, lineHeight: '18px' },
-        }, [
-          h('thead', { key: 'thead' }, h('tr', null, [
-            h('th', { key: 'time', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('requests.time')),
-            h('th', { key: 'session', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('details.session')),
-            h('th', { key: 'purpose', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('requests.purpose')),
-            h('th', { key: 'prompt', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.prompt')),
-            h('th', { key: 'output', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.output')),
-            h('th', { key: 'cacheRead', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.cacheRead')),
-            h('th', { key: 'cost', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.cost')),
-          ])),
-          h('tbody', { key: 'tbody' }, items.map(row => h('tr', { key: row.key }, [
-            h('td', { key: 'time', style: { ...cellStyle, textAlign: 'left', fontVariantNumeric: 'tabular-nums' } }, formatTime(row.ts)),
-            h('td', { key: 'session', style: { ...cellStyle, textAlign: 'left' } }, requestSessionCell(row, sessionTitles, t)),
-            h('td', { key: 'purpose', style: { ...cellStyle, textAlign: 'left' } }, purposeLabel(t, row.purpose)),
-            h('td', { key: 'prompt', style: rightCell }, tokenCell(row.promptTokens)),
-            h('td', { key: 'output', style: rightCell }, tokenCell(row.outputTokens)),
-            h('td', { key: 'cacheRead', style: rightCell }, tokenCell(row.cacheReadTokens)),
-            h('td', { key: 'cost', style: rightCell }, formatCostCell(row.cost, undefined, { mixed: t('table.costMixed') })),
-          ]))),
-        ]))
+        table = h(RequestRows, { key: 'table', items, sessionTitles, t })
       }
       const body = h('div', {
         key: 'body',
@@ -5116,6 +5641,752 @@ window.__ModuleLoader__.load({
         body,
         footer,
       ])
+    }
+
+    /**
+     * Pure presentation for the drill-down request pane (M3). The fetching
+     * wrapper `SessionRequestTable` owns the RPC; separating the render keeps
+     * loading/empty/error and pagination states unit-testable without a DOM.
+     * @param {object} props - `{state, t, sessionTitles, limit, onLoadMore, onRetry}`.
+     * @returns {object} React element.
+     */
+    function SessionRequestsSection(props) {
+      const t = props.t
+      const state = isPlainObject(props.state) ? props.state : createDetailsState()
+      const sessionTitles = isPlainObject(props.sessionTitles) ? props.sessionTitles : null
+      const limit = Number.isInteger(props.limit) && props.limit > 0 ? props.limit : DETAILS_PAGE_SIZE
+      const items = Array.isArray(state.items) ? state.items : []
+      const total = countNumber(state.total)
+      const progress = total > 0
+        ? items.length >= total
+          ? t('details.loadedAll', { total: formatTokens(total) })
+          : t('details.progress', { shown: formatTokens(items.length), total: formatTokens(total) })
+        : ''
+      let notice = null
+      if (state.status === 'loading' || state.status === 'idle') {
+        notice = h('p', { key: 'loading', role: 'status', style: { ...HINT_STYLE, margin: 0 } }, t('details.loading'))
+      } else if (state.status === 'error') {
+        notice = h('div', {
+          key: 'error',
+          role: 'alert',
+          'data-dsh-part': 'session-requests-error',
+          style: { display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-start' },
+        }, [
+          h('p', { key: 'message', style: { ...ERROR_TEXT_STYLE, margin: 0 } }, rpcErrorMessage(t, state.error)),
+          h('p', { key: 'hint', style: { ...HINT_STYLE, margin: 0 } }, t('sessionDetail.requestsFailed')),
+          h('button', {
+            key: 'retry',
+            type: 'button',
+            'data-dsh-part': 'session-requests-retry',
+            onClick: typeof props.onRetry === 'function' ? props.onRetry : () => {},
+            style: buttonStyle('primary'),
+          }, t('button.retry')),
+        ])
+      }
+      let table = null
+      if (items.length === 0) {
+        if (notice === null) {
+          notice = h('p', { key: 'empty', style: { ...HINT_STYLE, margin: 0 } }, t('sessionDetail.requestsEmpty'))
+        }
+      } else {
+        table = h(RequestRows, {
+          key: 'table',
+          items,
+          sessionTitles,
+          t,
+          part: 'session-requests-table',
+        })
+      }
+      const canLoadMore = state.status === 'ready' && items.length > 0 && items.length < total
+      const footer = canLoadMore || state.status === 'loading-more'
+        ? h('div', {
+          key: 'footer',
+          'data-dsh-part': 'session-requests-footer',
+          style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
+        }, [
+          state.status === 'loading-more'
+            ? h('span', { key: 'loading', role: 'status', style: { ...HINT_STYLE, margin: 0 } }, t('details.loadingMore'))
+            : h('button', {
+              key: 'more',
+              type: 'button',
+              'data-dsh-part': 'session-requests-load-more',
+              disabled: state.status !== 'ready',
+              onClick: typeof props.onLoadMore === 'function' ? props.onLoadMore : () => {},
+              style: buttonStyle('primary'),
+            }, t('details.loadMore')),
+        ])
+        : null
+      return h('section', {
+        'data-dsh-part': 'session-requests',
+        style: surfaceStyle({ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }),
+      }, [
+        h(SectionHeading, {
+          key: 'head',
+          title: t('sessionDetail.requestsTitle'),
+          hint: t('sessionDetail.requestsHint', { limit }),
+          action: progress !== '' ? h('span', { style: { ...HINT_STYLE, margin: 0 } }, progress) : null,
+        }),
+        notice,
+        table,
+        footer,
+      ])
+    }
+
+    /**
+     * Fetching wrapper for the drill-down request pane.
+     *
+     * Calls the Host `requests` endpoint with `{from,to,limit:20,offset}` plus
+     * the combined `sessionIds` list in subtree mode (or the legacy
+     * `sessionId` filter in single-session mode) and pages 20 rows at a time.
+     * A changed range/session/toggle resets to page 1; a mid-list failure keeps
+     * the rows already rendered.
+     * @param {object} props - `{t, rpc, range, fallbackRange, sessionId, includeDescendants, sessionIds, sessionTitles, limit}`.
+     * @returns {object} React element.
+     */
+    function SessionRequestTable(props) {
+      const range = normalizeRange(props.range)
+      const fallback = normalizeRange(props.fallbackRange)
+      const from = range.from !== '' || range.to !== '' ? range.from : fallback.from
+      const to = range.from !== '' || range.to !== '' ? range.to : fallback.to
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
+      const includeDescendants = props.includeDescendants === true
+      const sessionIds = normalizeSessionIdList(props.sessionIds)
+      const limit = Number.isInteger(props.limit) && props.limit > 0 ? props.limit : DETAILS_PAGE_SIZE
+      const scopeKey = [
+        from,
+        to,
+        sessionId,
+        includeDescendants ? 'subtree' : 'single',
+        includeDescendants ? sessionIds.join('|') : '',
+      ].join('~')
+      const [state, setState] = React.useState(() => createDetailsState(scopeKey))
+      const [nonce, setNonce] = React.useState(0)
+      const requestRef = React.useRef(0)
+      React.useEffect(() => {
+        const rpc = props.rpc
+        if (rpc === null || typeof rpc !== 'object' || typeof rpc.call !== 'function') return undefined
+        if (detailsRangeChanged(state, scopeKey)) {
+          setState(current => detailsReducer(current, { type: 'range', rangeKey: scopeKey }))
+          return undefined
+        }
+        const requestId = requestRef.current + 1
+        requestRef.current = requestId
+        const offset = state.offset
+        setState(current => detailsReducer(current, { type: 'load' }))
+        let cancelled = false
+        const load = async () => {
+          let result
+          try {
+            result = await rpc.call('requests', sessionRequestsPayload({ from, to }, {
+              limit,
+              offset,
+              sessionId,
+              includeDescendants,
+              sessionIds,
+            }))
+          } catch (caught) {
+            result = { ok: false, error: { code: 'transport', message: errorMessage(caught), details: {} } }
+          }
+          if (cancelled || requestRef.current !== requestId) return
+          if (!isPlainObject(result) || result.ok !== true) {
+            const failure = isPlainObject(result) && isPlainObject(result.error)
+              ? result.error
+              : { code: 'invalid-response', message: '', details: {} }
+            setState(current => detailsReducer(current, { type: 'error', error: failure }))
+            return
+          }
+          const page = normalizeRequests(result.value, offset)
+          setState(current => detailsReducer(current, { type: 'loaded', items: page.items, total: page.total }))
+        }
+        load()
+        return () => {
+          cancelled = true
+        }
+      }, [props.rpc, scopeKey, state.rangeKey, state.offset, nonce])
+      return h(SessionRequestsSection, {
+        state,
+        t: props.t,
+        sessionTitles: props.sessionTitles,
+        limit,
+        onLoadMore: () => setState(current => detailsReducer(current, { type: 'more' })),
+        onRetry: () => setNonce(value => value + 1),
+      })
+    }
+
+    /**
+     * Tool-group table shared by the Sources tab and the M3 session drill-down.
+     * @param {object} props - `{byToolGroup, totalPromptTokens, t}`.
+     * @returns {object} React element.
+     */
+    function ToolGroupTable(props) {
+      const t = props.t
+      return h(DataTable, {
+        title: t('table.toolGroups.title'),
+        hint: t('table.toolGroups.hint'),
+        columns: [
+          {
+            key: 'group',
+            label: t('table.toolGroups.group'),
+            maxWidth: 260,
+            // M2.8 group labels include longer names and custom keys; keep the
+            // three columns aligned by ellipsizing with the full label in the
+            // native tooltip instead of widening the table.
+            render: row => h('span', {
+              title: row.label,
+              style: {
+                display: 'inline-block',
+                maxWidth: 260,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                verticalAlign: 'bottom',
+              },
+            }, row.label),
+          },
+          {
+            key: 'tokens',
+            label: t('table.toolGroups.tokens'),
+            align: 'right',
+            render: row => tokenCell(row.tokens),
+          },
+          {
+            key: 'share',
+            label: t('table.toolGroups.share'),
+            align: 'right',
+            render: row => formatPercent(row.share),
+          },
+        ],
+        rows: toolGroupRows(props.byToolGroup, props.totalPromptTokens, t),
+        emptyText: t('table.toolGroups.empty'),
+      })
+    }
+
+    /**
+     * M3 single-session drill-down view (Sessions tab only).
+     *
+     * Header: breadcrumb built from the range-wide `summary.bySession` parent
+     * links, Back, resolved title + short id, and the subtree toggle
+     * (`includeDescendants`, default on). Below the shared summary cards the
+     * view renders the full mini dashboard for the selected session set: call
+     * purpose, models, content sources, tool groups, search/fetch, daily
+     * trend, direct children (clickable to drill further) and paginated
+     * requests. When the Host reports `detailAvailable === false` (request
+     * detail aged out) only the cards plus a localized note remain.
+     * @param {object} props - `{state, t, rpc, range, sessionTitles, breadcrumb, onBack, onNavigate, onToggleDescendants, onRetry}`.
+     * @returns {object} React element.
+     */
+    function SessionDetailView(props) {
+      const t = props.t
+      const state = isPlainObject(props.state) ? props.state : createDrillState()
+      const [webApiOpen, setWebApiOpen] = React.useState(false)
+      // The reducer stores a normalized detail; re-normalize defensively when a
+      // caller hands the exported component a raw Host payload.
+      let detail = null
+      if (isPlainObject(state.data)) {
+        detail = isPlainObject(state.data.summary) && Array.isArray(state.data.summary.byPurposeEntries)
+          ? state.data
+          : normalizeSessionDetail(state.data)
+      }
+      const sessionTitles = isPlainObject(props.sessionTitles) ? props.sessionTitles : null
+      const sessionId = typeof state.sessionId === 'string' ? state.sessionId : ''
+      const includeDescendants = state.includeDescendants === true
+      const onBack = typeof props.onBack === 'function' ? props.onBack : () => {}
+      const onNavigate = typeof props.onNavigate === 'function' ? props.onNavigate : () => {}
+      const onToggleDescendants = typeof props.onToggleDescendants === 'function' ? props.onToggleDescendants : () => {}
+      const resolvedTitle = sessionDisplayName(sessionId, sessionTitles, '')
+      const displayName = resolvedTitle !== '' && resolvedTitle !== sessionId
+        ? resolvedTitle
+        : sessionId !== '' ? shortId(sessionId, 12) : t('table.sessions.unknown')
+      const crumbRows = Array.isArray(props.breadcrumb) && props.breadcrumb.length > 0
+        ? props.breadcrumb
+        : sessionId !== '' ? [{ sessionId, parentSessionId: null }] : []
+      const crumbStyle = {
+        font: 'inherit',
+        fontSize: 12,
+        lineHeight: '18px',
+        color: COLORS.brand,
+        background: 'none',
+        border: 'none',
+        padding: '1px 2px',
+        cursor: 'pointer',
+        maxWidth: 220,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      }
+      const crumbs = []
+      crumbRows.forEach((row, index) => {
+        const id = typeof row?.sessionId === 'string' ? row.sessionId : ''
+        const name = sessionDisplayName(id, sessionTitles, '')
+        const label = name !== '' && name !== id ? name : shortId(id, 12)
+        if (index > 0) {
+          crumbs.push(h('span', {
+            key: `crumb-sep-${index}`,
+            'aria-hidden': 'true',
+            style: { color: COLORS.muted, fontSize: 11, flex: 'none' },
+          }, '›'))
+        }
+        if (index === crumbRows.length - 1) {
+          crumbs.push(h('span', {
+            key: `crumb-${id}`,
+            'data-dsh-part': 'session-crumb-current',
+            'aria-current': 'page',
+            title: id,
+            style: { ...crumbStyle, color: COLORS.text, cursor: 'default', fontWeight: 500 },
+          }, label))
+        } else {
+          crumbs.push(h('button', {
+            key: `crumb-${id}`,
+            type: 'button',
+            'data-dsh-part': 'session-crumb',
+            'data-session-id': id,
+            'aria-label': t('sessionDetail.crumb', { name: label }),
+            title: id,
+            onClick: () => onNavigate(id),
+            style: crumbStyle,
+          }, label))
+        }
+      })
+      const modeBadgeStyle = {
+        fontSize: 10,
+        lineHeight: '14px',
+        color: COLORS.muted,
+        border: `0.5px solid ${COLORS.border}`,
+        borderRadius: 999,
+        padding: '0 6px',
+        whiteSpace: 'nowrap',
+        flex: 'none',
+      }
+      const header = h('section', {
+        key: 'header',
+        'data-dsh-part': 'session-detail-header',
+        style: surfaceStyle({ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }),
+      }, [
+        h('div', {
+          key: 'nav',
+          style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 },
+        }, [
+          h('button', {
+            key: 'back',
+            type: 'button',
+            'data-dsh-part': 'session-detail-back',
+            'aria-label': t('sessionDetail.back'),
+            title: t('sessionDetail.back'),
+            onClick: onBack,
+            style: { ...buttonStyle(), flex: 'none' },
+          }, [
+            h('span', { key: 'arrow', 'aria-hidden': 'true' }, '←'),
+            h('span', { key: 'label' }, t('sessionDetail.back')),
+          ]),
+          h('nav', {
+            key: 'crumbs',
+            'aria-label': t('sessionDetail.breadcrumb'),
+            style: { display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap', minWidth: 0 },
+          }, crumbs),
+        ]),
+        h('div', {
+          key: 'title',
+          style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', minWidth: 0 },
+        }, [
+          h('h2', {
+            key: 'name',
+            'data-dsh-part': 'session-detail-title',
+            title: sessionId,
+            style: {
+              margin: 0,
+              fontSize: 16,
+              lineHeight: '24px',
+              fontWeight: 600,
+              color: COLORS.text,
+              minWidth: 0,
+              maxWidth: 520,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            },
+          }, displayName),
+          sessionId !== ''
+            ? h('code', {
+              key: 'id',
+              'data-dsh-part': 'session-detail-id',
+              title: sessionId,
+              style: { fontFamily: MONO_STACK, fontSize: 11, color: COLORS.muted },
+            }, shortId(sessionId, 12))
+            : null,
+          h('span', { key: 'mode', style: modeBadgeStyle }, includeDescendants
+            ? t('sessionDetail.subtreeNote')
+            : t('sessionDetail.singleNote')),
+        ]),
+        h('div', {
+          key: 'toggle',
+          'data-dsh-part': 'session-detail-toggle',
+          style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 },
+        }, [
+          h(Switch, {
+            checked: includeDescendants,
+            onChange: next => onToggleDescendants(next === true),
+            label: t('sessionDetail.includeDescendants'),
+          }),
+          h('span', {
+            key: 'label',
+            style: { fontSize: 12, lineHeight: '18px', fontWeight: 500, color: COLORS.text },
+          }, includeDescendants ? t('sessionDetail.includeDescendants') : t('sessionDetail.onlySession')),
+          h('span', {
+            key: 'hint',
+            style: { ...HINT_STYLE, margin: 0 },
+          }, includeDescendants ? t('sessionDetail.toggleHint') : t('sessionDetail.toggleSingleHint')),
+        ]),
+      ])
+      const children = [header]
+      const summary = detail !== null ? detail.summary : null
+      if (state.status === 'error') {
+        children.push(h('section', {
+          key: 'error',
+          role: 'alert',
+          'data-dsh-part': 'session-detail-error',
+          style: surfaceStyle({ padding: '18px 16px', display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }),
+        }, [
+          h('p', { key: 'message', style: { margin: 0, fontSize: 13, lineHeight: '20px', color: COLORS.danger } }, rpcErrorMessage(t, state.error)),
+          h('p', { key: 'hint', style: { ...HINT_STYLE, margin: 0 } }, t('sessionDetail.loadFailed')),
+          typeof props.onRetry === 'function'
+            ? h('button', {
+              key: 'retry',
+              type: 'button',
+              'data-dsh-part': 'session-detail-retry',
+              onClick: props.onRetry,
+              style: buttonStyle('primary'),
+            }, t('button.retry'))
+            : null,
+        ]))
+        return h('div', {
+          'data-dsh-part': 'session-detail',
+          style: { display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 },
+        }, children)
+      }
+      if (detail === null) {
+        children.push(h('p', {
+          key: 'loading',
+          role: 'status',
+          'data-dsh-part': 'session-detail-loading',
+          style: { ...HINT_STYLE, margin: 0 },
+        }, t('sessionDetail.loading')))
+        return h('div', {
+          'data-dsh-part': 'session-detail',
+          style: { display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 },
+        }, children)
+      }
+      if (state.status === 'empty') {
+        children.push(h('section', {
+          key: 'missing',
+          role: 'status',
+          'data-dsh-part': 'session-detail-missing',
+          style: surfaceStyle({ padding: '28px 20px', display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }),
+        }, [
+          h('p', { key: 'text', style: { margin: 0, fontSize: 14, lineHeight: '20px', color: COLORS.text } }, t('sessionDetail.missing')),
+          h('p', { key: 'hint', style: { ...HINT_STYLE, margin: 0 } }, t('sessionDetail.missingHint')),
+          h('button', {
+            key: 'back',
+            type: 'button',
+            'data-dsh-part': 'session-detail-missing-back',
+            onClick: onBack,
+            style: { ...buttonStyle('primary'), alignSelf: 'flex-start' },
+          }, t('sessionDetail.back')),
+        ]))
+        // Keep surviving direct children navigable when the parent itself has
+        // aged out of the selected range.
+        if (detail.children.length > 0) {
+          const missingChildStyle = {
+            fontSize: 12,
+            color: COLORS.brand,
+            background: 'none',
+            border: 'none',
+            padding: 0,
+            cursor: 'pointer',
+            maxWidth: 320,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }
+          children.push(h('section', {
+            key: 'missing-children',
+            'data-dsh-part': 'session-detail-missing-children',
+            style: surfaceStyle({ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }),
+          }, [
+            h(SectionHeading, { key: 'head', title: t('sessionDetail.childrenTitle'), hint: t('sessionDetail.childrenHint') }),
+            ...detail.children.map(child => {
+              const childId = typeof child.sessionId === 'string' ? child.sessionId : ''
+              const name = sessionDisplayName(childId, sessionTitles, '')
+              const label = name !== '' && name !== childId ? name : shortId(childId, 12)
+              const stats = subtreeStats(child)
+              return h('button', {
+                key: childId,
+                type: 'button',
+                'data-dsh-part': 'session-detail-missing-child',
+                'data-session-id': childId,
+                'aria-label': t('sessionDetail.child', { name: label }),
+                title: childId,
+                onClick: () => onNavigate(childId),
+                style: { ...missingChildStyle, alignSelf: 'flex-start' },
+              }, `${label} · ${formatTokens(stats.requests)} req · ${formatCompactTokens(stats.tokens)} tok`)
+            }),
+          ]))
+        }
+        return h('div', {
+          'data-dsh-part': 'session-detail',
+          style: { display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 },
+        }, children)
+      }
+      if (state.status === 'loading') {
+        children.push(h('p', {
+          key: 'refreshing',
+          role: 'status',
+          style: { ...HINT_STYLE, margin: 0 },
+        }, t('panel.refreshing')))
+      }
+      const cards = summaryCardModels(t, summary)
+      children.push(h('section', {
+        key: 'summary',
+        'data-dsh-part': 'session-detail-summary',
+        style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 },
+      }, [
+        h(SectionHeading, { key: 'head', title: t('sessionDetail.summaryTitle'), hint: t('sessionDetail.cardsHint') }),
+        h('div', {
+          key: 'grid',
+          style: {
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+            gap: 10,
+          },
+        }, cards.map(card => h(MetricCard, {
+          key: card.key,
+          label: card.label,
+          value: card.value,
+          valueTitle: card.valueTitle,
+          hint: card.hint,
+          lines: card.lines,
+          tone: card.tone,
+        }))),
+      ]))
+      if (detail.detailAvailable === false) {
+        children.push(h('p', {
+          key: 'unavailable',
+          role: 'status',
+          'data-dsh-part': 'session-detail-unavailable',
+          title: detail.detailReason ?? undefined,
+          style: surfaceStyle({
+            margin: 0,
+            padding: '10px 12px',
+            background: `color-mix(in srgb, ${COLORS.warning} 8%, ${COLORS.surface})`,
+            borderColor: `color-mix(in srgb, ${COLORS.warning} 35%, ${COLORS.border})`,
+            fontSize: 12,
+            lineHeight: '18px',
+            color: COLORS.text,
+          }),
+        }, t('sessionDetail.unavailable')))
+        return h('div', {
+          'data-dsh-part': 'session-detail',
+          style: { display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 },
+        }, children)
+      }
+      if (detail.detailPartial) {
+        children.push(h('p', {
+          key: 'partial',
+          role: 'status',
+          'data-dsh-part': 'session-detail-partial',
+          style: { ...HINT_STYLE, margin: 0 },
+        }, t('sessionDetail.partial')))
+      }
+      const purposeEntries = summary.byPurposeEntries.map(entry => ({
+        key: entry.key,
+        label: purposeLabel(t, entry.key),
+        value: entry.tokens,
+      }))
+      children.push(h('div', {
+        key: 'purpose',
+        'data-dsh-part': 'session-detail-purpose',
+        style: { display: 'flex', flexDirection: 'column', minWidth: 0 },
+      }, h(StackedBar, {
+        title: t('chart.purpose.title'),
+        hint: t('chart.purpose.hint'),
+        entries: purposeEntries,
+        t,
+      })))
+      children.push(h('div', {
+        key: 'models',
+        'data-dsh-part': 'session-detail-models',
+        style: { display: 'flex', flexDirection: 'column', minWidth: 0 },
+      }, h(ModelsTable, {
+        rows: summary.byModel,
+        currency: summary.cost.currency,
+        t,
+      })))
+      children.push(h(StackedBar, {
+        key: 'category',
+        title: t('chart.category.title'),
+        hint: t('chart.category.hint'),
+        entries: categoryGroupEntries(summary.byCategoryGroup, t),
+        t,
+      }))
+      children.push(h('section', {
+        key: 'categoryDetail',
+        'data-dsh-part': 'session-detail-category-detail',
+        style: surfaceStyle({ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }),
+      }, [
+        h(SectionHeading, {
+          key: 'head',
+          title: t('chart.category.detailTitle'),
+          hint: t('chart.category.detailHint'),
+        }),
+        h(CategoryDetailTable, {
+          key: 'detail',
+          byCategory: summary.byCategory,
+          totalPromptTokens: summary.totals.promptTokens,
+          t,
+        }),
+      ]))
+      children.push(h('div', {
+        key: 'tools',
+        'data-dsh-part': 'session-detail-tools',
+        style: { display: 'flex', flexDirection: 'column', minWidth: 0 },
+      }, h(ToolGroupTable, {
+        byToolGroup: summary.byToolGroup,
+        totalPromptTokens: summary.totals.promptTokens,
+        t,
+      })))
+      const webApi = detail.webApi
+      children.push(h('section', {
+        key: 'web',
+        'data-dsh-part': 'session-detail-web',
+        style: { display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 },
+      }, [
+        h('div', {
+          key: 'card',
+          style: {
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+            gap: 10,
+          },
+        }, h(WebApiSummaryCard, { t, webApi })),
+        h(WebApiSessionTable, {
+          key: 'rows',
+          rows: webApi.bySession,
+          currency: summary.cost.currency,
+          sessionTitles,
+          hint: t('sessionDetail.webHint'),
+          open: webApiOpen,
+          onToggle: () => setWebApiOpen(open => !open),
+          t,
+        }),
+      ]))
+      children.push(h('div', {
+        key: 'trend',
+        'data-dsh-part': 'session-detail-trend',
+        style: { display: 'flex', flexDirection: 'column', minWidth: 0 },
+      }, h(TrendChart, { byDay: summary.byDay, t })))
+      // Direct-child rows show the child's subtree totals when the Host sent
+      // the descendant closure in `summary.bySession`; in single-session mode
+      // the rows fall back to the child's own aggregate.
+      const detailTree = buildSessionTree(summary.bySession)
+      const treeNodes = new Map(detailTree.nodes.map(node => [node.key, node]))
+      const childRows = detail.children.map(child => {
+        const node = treeNodes.get(child.sessionId)
+        const stats = node !== undefined && node.subtree !== null ? node.subtree : subtreeStats(child)
+        return {
+          key: child.sessionId,
+          sessionId: child.sessionId,
+          tokens: stats.tokens,
+          requests: stats.requests,
+          promptTokens: stats.splitAvailable ? stats.promptTokens : null,
+          outputTokens: stats.splitAvailable ? stats.outputTokens : null,
+          cost: stats.cost,
+        }
+      }).sort((left, right) => (right.tokens - left.tokens) || left.sessionId.localeCompare(right.sessionId))
+      const childTitleStyle = {
+        fontSize: 12,
+        color: COLORS.brand,
+        background: 'none',
+        border: 'none',
+        padding: 0,
+        cursor: 'pointer',
+        maxWidth: 320,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      }
+      children.push(h('div', {
+        key: 'children',
+        'data-dsh-part': 'session-detail-children',
+        style: { display: 'flex', flexDirection: 'column', minWidth: 0 },
+      }, h(DataTable, {
+        title: t('sessionDetail.childrenTitle'),
+        hint: includeDescendants ? t('sessionDetail.childrenHint') : t('sessionDetail.childrenHintSingle'),
+        columns: [
+          {
+            key: 'session',
+            label: t('table.sessions.session'),
+            maxWidth: 340,
+            render: row => {
+              const childId = typeof row.sessionId === 'string' ? row.sessionId : ''
+              const name = sessionDisplayName(childId, sessionTitles, '')
+              const label = name !== '' && name !== childId ? name : shortId(childId, 12)
+              return h('button', {
+                type: 'button',
+                'data-dsh-part': 'session-detail-child',
+                'data-session-id': childId,
+                'aria-label': t('sessionDetail.child', { name: label }),
+                title: childId,
+                onClick: () => onNavigate(childId),
+                style: childTitleStyle,
+              }, label)
+            },
+          },
+          {
+            key: 'requests',
+            label: t('table.sessions.requests'),
+            align: 'right',
+            render: row => formatTokens(row.requests),
+          },
+          {
+            key: 'promptTokens',
+            label: t('table.sessions.promptTokens'),
+            align: 'right',
+            render: row => (row.promptTokens !== null ? tokenCell(row.promptTokens) : t('card.valueUnavailable')),
+          },
+          {
+            key: 'outputTokens',
+            label: t('table.sessions.outputTokens'),
+            align: 'right',
+            render: row => (row.outputTokens !== null ? tokenCell(row.outputTokens) : t('card.valueUnavailable')),
+          },
+          {
+            key: 'cost',
+            label: t('table.cost'),
+            align: 'right',
+            render: row => formatCostCell(row.cost, summary.cost.currency, {
+              mixed: t('table.costMixed'),
+              unpriced: t('card.valueUnavailable'),
+            }),
+          },
+        ],
+        rows: childRows,
+        emptyText: t('sessionDetail.childrenEmpty'),
+      })))
+      children.push(h(SessionRequestTable, {
+        key: 'requests',
+        t,
+        rpc: props.rpc,
+        range: detail.range,
+        fallbackRange: props.range,
+        sessionId,
+        includeDescendants,
+        sessionIds: detail.sessionIds,
+        sessionTitles,
+        limit: DETAILS_PAGE_SIZE,
+      }))
+      return h('div', {
+        'data-dsh-part': 'session-detail',
+        style: { display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 },
+      }, children)
     }
 
     /**
@@ -5483,27 +6754,18 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Overview tab: cards, Web API sessions Top-5, purpose/content-source bars,
-     * the daily trend, and compact Top-5 session/model summaries plus the
-     * accounting footnote. Full tables live on their own tabs.
-     * @param {object} props - `{summary, meta, t, channel, sessionTitles}`.
-     * @returns {object} React element.
+     * Build the summary card models shared by the Overview tab and the M3
+     * session drill-down. The Web API card is appended by the caller because
+     * the drill-down keeps its filtered search/fetch section separate.
+     * @param {(key: string, params?: object) => string} t - translator.
+     * @param {object} summary - normalized summary.
+     * @returns {Array<object>} MetricCard props.
      */
-    function OverviewTab(props) {
-      const summary = props.summary
-      const t = props.t
+    function summaryCardModels(t, summary) {
       const totals = summary.totals
-      const purposeEntries = summary.byPurposeEntries.map(entry => ({
-        key: entry.key,
-        label: purposeLabel(t, entry.key),
-        value: entry.tokens,
-      }))
-      const categoryEntries = categoryGroupEntries(summary.byCategoryGroup, t)
       const unpriced = summary.cost.unpricedRequests
       const costMixed = summary.cost.currency === 'mixed'
-      const webApi = summary.webApi
-      const webApiSessionRows = webApi.bySession.filter(row => row.calls.total > 0)
-      const cards = [
+      return [
         {
           key: 'total',
           label: t('card.total'),
@@ -5555,8 +6817,28 @@ window.__ModuleLoader__.load({
             : t('card.costHint'),
           tone: unpriced > 0 ? 'warning' : 'default',
         },
-        webApiSummaryCardModel(t, webApi),
       ]
+    }
+
+    /**
+     * Overview tab: cards, Web API sessions Top-5, purpose/content-source bars,
+     * the daily trend, and compact Top-5 session/model summaries plus the
+     * accounting footnote. Full tables live on their own tabs.
+     * @param {object} props - `{summary, meta, t, channel, sessionTitles}`.
+     * @returns {object} React element.
+     */
+    function OverviewTab(props) {
+      const summary = props.summary
+      const t = props.t
+      const purposeEntries = summary.byPurposeEntries.map(entry => ({
+        key: entry.key,
+        label: purposeLabel(t, entry.key),
+        value: entry.tokens,
+      }))
+      const categoryEntries = categoryGroupEntries(summary.byCategoryGroup, t)
+      const webApi = summary.webApi
+      const webApiSessionRows = webApi.bySession.filter(row => row.calls.total > 0)
+      const cards = [...summaryCardModels(t, summary), webApiSummaryCardModel(t, webApi)]
 
       return h('div', {
         style: { display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 },
@@ -5641,7 +6923,9 @@ window.__ModuleLoader__.load({
     /**
      * Sessions tab: the full expandable session tree plus the full Web API
      * sessions table (its normal 10-row fold and 100-row Host cap apply).
-     * @param {object} props - `{summary, t, sessionTitles, session, webApiSessions}`.
+     * M3 wires `onOpen` to the in-place drill-down and shows the drill failure
+     * warning (after an error the panel clears the selection and returns here).
+     * @param {object} props - `{summary, t, sessionTitles, session, webApiSessions, onOpen, drillError, onRetryDrill}`.
      * @returns {object} React element.
      */
     function SessionsTab(props) {
@@ -5650,12 +6934,21 @@ window.__ModuleLoader__.load({
       return h('div', {
         style: { display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 },
       }, [
+        props.drillError !== null && props.drillError !== undefined
+          ? h(RefreshWarning, {
+            key: 'drill-error',
+            t,
+            error: props.drillError,
+            onRetry: typeof props.onRetryDrill === 'function' ? props.onRetryDrill : () => {},
+          })
+          : null,
         h(SessionTreeTable, {
           key: 'sessions',
           bySession: summary.bySession,
           currency: summary.cost.currency,
           expanded: props.session?.expanded ?? null,
           onToggle: props.session?.onToggle,
+          onOpen: typeof props.onOpen === 'function' ? props.onOpen : null,
           sessionTitles: props.sessionTitles ?? null,
           t,
         }),
@@ -5695,7 +6988,6 @@ window.__ModuleLoader__.load({
       const summary = props.summary
       const t = props.t
       const categoryEntries = categoryGroupEntries(summary.byCategoryGroup, t)
-      const toolGroupTableRows = toolGroupRows(summary.byToolGroup, summary.totals.promptTokens, t)
       return h('div', {
         style: { display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 },
       }, [
@@ -5723,45 +7015,11 @@ window.__ModuleLoader__.load({
             t,
           }),
         ]),
-        h(DataTable, {
+        h(ToolGroupTable, {
           key: 'toolGroups',
-          title: t('table.toolGroups.title'),
-          hint: t('table.toolGroups.hint'),
-          columns: [
-            {
-              key: 'group',
-              label: t('table.toolGroups.group'),
-              maxWidth: 260,
-              // M2.8 group labels include longer names and custom keys; keep the
-              // three columns aligned by ellipsizing with the full label in the
-              // native tooltip instead of widening the table.
-              render: row => h('span', {
-                title: row.label,
-                style: {
-                  display: 'inline-block',
-                  maxWidth: 260,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  verticalAlign: 'bottom',
-                },
-              }, row.label),
-            },
-            {
-              key: 'tokens',
-              label: t('table.toolGroups.tokens'),
-              align: 'right',
-              render: row => tokenCell(row.tokens),
-            },
-            {
-              key: 'share',
-              label: t('table.toolGroups.share'),
-              align: 'right',
-              render: row => formatPercent(row.share),
-            },
-          ],
-          rows: toolGroupTableRows,
-          emptyText: t('table.toolGroups.empty'),
+          byToolGroup: summary.byToolGroup,
+          totalPromptTokens: summary.totals.promptTokens,
+          t,
         }),
       ])
     }
@@ -7119,8 +8377,13 @@ window.__ModuleLoader__.load({
      * the inline Settings tab. Config is read once on mount (it also decides
      * whether the active tab may be restored from browser storage). Settings
      * stays mounted after its first visit so unsaved edits survive tab switches.
+     *
+     * M3 adds the in-place session drill-down: only the Sessions tab renders
+     * `SessionDetailView` (replacing the tree) while `drill.sessionId` is set;
+     * the selection lives outside the tab state, so switching tabs keeps it.
      * @param {object} props - slot props plus injected services; headless tests
-     *   may pass `initialTab` and `initialSettingsVisited`.
+     *   may pass `initialTab`, `initialSettingsVisited`, `initialSummary` and
+     *   `initialDrill` to seed state without running effects.
      * @returns {object} React element.
      */
     function UsagePanel(props) {
@@ -7146,8 +8409,17 @@ window.__ModuleLoader__.load({
         props.initialSettingsVisited === true
         || (isValidTab(props.initialTab) && props.initialTab === SETTINGS_TAB)
       ))
-      const [summary, setSummary] = React.useState(null)
-      const [status, setStatus] = React.useState('loading')
+      // Headless tests can seed the panel with a summary/drill so the render
+      // tree is observable without running effects (same escape hatch as
+      // `initialTab` / `initialSettingsVisited`).
+      const initialSummary = React.useMemo(
+        () => (isPlainObject(props.initialSummary) ? normalizeSummary(props.initialSummary) : null),
+        [props.initialSummary],
+      )
+      const [summary, setSummary] = React.useState(initialSummary)
+      const [status, setStatus] = React.useState(() => (
+        initialSummary === null ? 'loading' : initialSummary.totals.requests > 0 ? 'ready' : 'empty'
+      ))
       const [error, setError] = React.useState(null)
       const [refreshError, setRefreshError] = React.useState(null)
       const [refreshing, setRefreshing] = React.useState(false)
@@ -7164,10 +8436,14 @@ window.__ModuleLoader__.load({
       const [sessionExpanded, setSessionExpanded] = React.useState({})
       const [details, setDetails] = React.useState(createDetailsState)
       const [detailsNonce, setDetailsNonce] = React.useState(0)
+      // M3 in-place drill-down. It is deliberately independent of `activeTab`,
+      // so switching to another main tab and back preserves the selection.
+      const [drill, setDrill] = React.useState(() => initialDrillState(props.initialDrill))
       const mountedRef = React.useRef(true)
       const requestRef = React.useRef(0)
       const detailsRef = React.useRef(0)
-      const hasDataRef = React.useRef(false)
+      const drillRef = React.useRef(0)
+      const hasDataRef = React.useRef(initialSummary !== null)
       const tabPolicyRef = React.useRef({ resolved: false })
       const tabTouchedRef = React.useRef(false)
 
@@ -7215,6 +8491,84 @@ window.__ModuleLoader__.load({
         setStatus(normalized.totals.requests > 0 ? 'ready' : 'empty')
         if (!quiet) setRefreshing(false)
       }, [rpc])
+
+      /**
+       * Fetch one session drill-down through the M3 `sessionDetail` endpoint.
+       *
+       * The named range (not `from|to`) is sent, so a range change can refetch
+       * immediately without waiting for the summary to resolve. A request-id
+       * ref drops stale responses; a Host error clears the selection (the pane
+       * returns to the tree and keeps `lastSessionId` for the retry warning).
+       * @param {string} sessionId - selected session id.
+       * @param {boolean} includeDescendants - subtree toggle state.
+       * @param {string} rangeValue - named range.
+       * @returns {Promise<void>} completion.
+       */
+      const fetchSessionDetail = React.useCallback(async (sessionId, includeDescendants, rangeValue) => {
+        if (!mountedRef.current || typeof sessionId !== 'string' || sessionId === '') return
+        const requestId = drillRef.current + 1
+        drillRef.current = requestId
+        setDrill(current => drillReducer(current, { type: 'refresh' }))
+        let result
+        try {
+          result = await rpc.call('sessionDetail', sessionDetailPayload(rangeValue, {
+            sessionId,
+            includeDescendants,
+          }))
+        } catch (caught) {
+          result = { ok: false, error: { code: 'transport', message: errorMessage(caught), details: {} } }
+        }
+        if (!mountedRef.current || drillRef.current !== requestId) return
+        if (!isPlainObject(result) || result.ok !== true) {
+          const failure = isPlainObject(result) && isPlainObject(result.error)
+            ? result.error
+            : { code: 'invalid-response', message: '', details: {} }
+          setDrill(current => drillReducer(current, { type: 'error', error: failure }))
+          return
+        }
+        let normalized
+        try {
+          normalized = normalizeSessionDetail(result.value)
+        } catch {
+          normalized = normalizeSessionDetail(null)
+        }
+        if (normalized.sessionId === '') normalized = { ...normalized, sessionId }
+        setDrill(current => drillReducer(current, { type: 'loaded', data: normalized }))
+      }, [rpc])
+
+      /**
+       * Open (or navigate to) a session detail. From the tree the default is
+       * subtree mode; navigating inside the drill keeps the user's toggle.
+       * @param {string} sessionId - session to show.
+       * @returns {void}
+       */
+      const openSessionDetail = React.useCallback(sessionId => {
+        if (typeof sessionId !== 'string' || sessionId === '') return
+        const includeDescendants = drill.sessionId !== null ? drill.includeDescendants : true
+        setDrill(current => drillReducer(current, { type: 'open', sessionId, includeDescendants }))
+        fetchSessionDetail(sessionId, includeDescendants, range).catch(() => {})
+      }, [drill.sessionId, drill.includeDescendants, range, fetchSessionDetail])
+
+      /**
+       * Back: clear the selection (and any pending response) and show the tree.
+       * @returns {void}
+       */
+      const closeSessionDetail = React.useCallback(() => {
+        drillRef.current += 1
+        setDrill(current => drillReducer(current, { type: 'close' }))
+      }, [])
+
+      /**
+       * Flip the subtree scope and refetch with the new `includeDescendants`.
+       * @param {boolean} includeDescendants - next toggle state.
+       * @returns {void}
+       */
+      const toggleSessionDescendants = React.useCallback(includeDescendants => {
+        if (drill.sessionId === null) return
+        const next = includeDescendants === true
+        setDrill(current => drillReducer(current, { type: 'toggle', includeDescendants: next }))
+        fetchSessionDetail(drill.sessionId, next, range).catch(() => {})
+      }, [drill.sessionId, range, fetchSessionDetail])
 
       const loadConfig = React.useCallback(async (options = {}) => {
         const quiet = options.quiet === true
@@ -7275,15 +8629,21 @@ window.__ModuleLoader__.load({
         setActiveTab(resolvedTab)
       }, [configStatus, configInfo])
 
+      const drillSessionId = drill.sessionId
+      const drillIncludeDescendants = drill.includeDescendants
       React.useEffect(() => {
         if (!mountedRef.current) return
         if (runtimeConfig === null || runtimeConfig.enableAutoRefresh !== true) return undefined
         const interval = clamp(Math.trunc(numberOr(runtimeConfig.autoRefreshIntervalMs, 30000)), 1000, 3600000)
         const timer = setInterval(() => {
           refresh(range, true).catch(() => {})
+          // Keep an open drill-down in sync with the same auto-refresh tick.
+          if (drillSessionId !== null) {
+            fetchSessionDetail(drillSessionId, drillIncludeDescendants, range).catch(() => {})
+          }
         }, interval)
         return () => clearInterval(timer)
-      }, [runtimeConfig, range, refresh])
+      }, [runtimeConfig, range, refresh, drillSessionId, drillIncludeDescendants, fetchSessionDetail])
 
       // Details pagination. The Host resolves named ranges to concrete bounds,
       // so `from|to` is the page's window identity: a same-key auto-refresh
@@ -7353,6 +8713,11 @@ window.__ModuleLoader__.load({
 
       const selectRange = nextRange => {
         if (nextRange === range) return
+        // An open drill-down follows the range change immediately: the
+        // `sessionDetail` payload carries the named range, so no summary round
+        // trip is needed before refetching.
+        const activeSessionId = drill.sessionId
+        const activeIncludeDescendants = drill.includeDescendants
         setRange(nextRange)
         setSummary(null)
         setStatus('loading')
@@ -7363,6 +8728,13 @@ window.__ModuleLoader__.load({
         setDetails(current => detailsReducer(current, { type: 'range' }))
         setSessionExpanded({})
         hasDataRef.current = false
+        if (activeSessionId !== null) {
+          setDrill(current => drillReducer(current, { type: 'range', rangeKey: '' }))
+          fetchSessionDetail(activeSessionId, activeIncludeDescendants, nextRange).catch(() => {})
+        } else if (drill.error !== null) {
+          // A stale drill-failure banner does not survive a range switch.
+          setDrill(current => drillReducer(current, { type: 'close' }))
+        }
       }
 
       /**
@@ -7378,6 +8750,9 @@ window.__ModuleLoader__.load({
           setDetailsNonce(nonce => nonce + 1)
         }
         refresh(range).catch(() => {})
+        if (drill.sessionId !== null) {
+          fetchSessionDetail(drill.sessionId, drill.includeDescendants, range).catch(() => {})
+        }
       }
 
       const handleConfigSaved = payload => {
@@ -7484,25 +8859,50 @@ window.__ModuleLoader__.load({
       } else if (summary !== null) {
         const sessionTitles = sessionsById ?? null
         if (activeTab === 'sessions') {
-          content = h(SessionsTab, {
-            key: 'sessions',
-            summary,
-            t,
-            sessionTitles,
-            session: {
-              expanded: sessionExpanded,
-              onToggle: key => setSessionExpanded(current => {
-                const next = { ...current }
-                if (next[key] === true) delete next[key]
-                else next[key] = true
-                return next
-              }),
-            },
-            webApiSessions: {
-              open: webApiSessionsOpen,
-              onToggle: () => setWebApiSessionsOpen(open => !open),
-            },
-          })
+          if (drill.sessionId !== null) {
+            // In-place drill-down: replaces the tree instead of opening a new
+            // tab/route. Back (or a failed fetch) returns to the tree.
+            content = h(SessionDetailView, {
+              key: 'session-detail',
+              state: drill,
+              t,
+              rpc,
+              range: summary.range,
+              sessionTitles,
+              breadcrumb: sessionBreadcrumb(summary.bySession, drill.sessionId),
+              onBack: closeSessionDetail,
+              onNavigate: openSessionDetail,
+              onToggleDescendants: toggleSessionDescendants,
+              onRetry: () => {
+                if (drill.lastSessionId !== '') openSessionDetail(drill.lastSessionId)
+              },
+            })
+          } else {
+            content = h(SessionsTab, {
+              key: 'sessions',
+              summary,
+              t,
+              sessionTitles,
+              onOpen: openSessionDetail,
+              drillError: drill.error,
+              onRetryDrill: () => {
+                if (drill.lastSessionId !== '') openSessionDetail(drill.lastSessionId)
+              },
+              session: {
+                expanded: sessionExpanded,
+                onToggle: key => setSessionExpanded(current => {
+                  const next = { ...current }
+                  if (next[key] === true) delete next[key]
+                  else next[key] = true
+                  return next
+                }),
+              },
+              webApiSessions: {
+                open: webApiSessionsOpen,
+                onToggle: () => setWebApiSessionsOpen(open => !open),
+              },
+            })
+          }
         } else if (activeTab === 'models') {
           content = h(ModelsTab, { key: 'models', summary, t })
         } else if (activeTab === 'sources') {
@@ -7874,6 +9274,18 @@ window.__ModuleLoader__.load({
         detailsReducer,
         detailsRangeKeyFromRange,
         detailsRangeChanged,
+        normalizeSessionRow,
+        normalizeSessionIdList,
+        normalizeSessionDetail,
+        webApiForSessions,
+        sessionDetailEmpty,
+        createDrillState,
+        drillReducer,
+        initialDrillState,
+        sessionDetailPayload,
+        sessionRequestsPayload,
+        sessionBreadcrumb,
+        summaryCardModels,
         normalizeDays,
         normalizeWebApi,
         normalizeWebApiSessions,
@@ -7911,12 +9323,16 @@ window.__ModuleLoader__.load({
           SourcesTab,
           WebTab,
           DetailsTab,
+          SessionDetailView,
+          SessionRequestTable,
+          SessionRequestsSection,
           ModelsTable,
           WebApiSummaryCard,
           StackedBar,
           CategoryDetailTable,
           SessionTreeTable,
           WebApiSessionTable,
+          ToolGroupTable,
           TrendChart,
           DataTable,
           Footnote,

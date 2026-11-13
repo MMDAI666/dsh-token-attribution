@@ -54,6 +54,13 @@ export const COST_SCHEMA_VERSION = 2
 /** Maximum session rows returned by `readSummary` (the client builds a tree). */
 export const MAX_SUMMARY_SESSIONS = 500
 
+/**
+ * Absolute cap on session ids included in one session drill-down response
+ * (the selected session plus its descendants). It matches the `bySession` row
+ * cap, so a full-range tree can never need more.
+ */
+export const MAX_SESSION_DETAIL_IDS = 500
+
 /** Installed plugin version recorded in `meta.json`. */
 export const INSTALLED_VERSION = '0.1.0'
 
@@ -724,7 +731,7 @@ function statSafe(file) {
  * @param {object} [options.logger] - host logger (unused; diagnostics route through `diag`).
  * @param {string} [options.homeDir] - override for `DSH_HOME`.
  * @param {string} [options.profile] - override for `DSH_PROFILE`.
- * @returns {object} store API (`append`, `flushNow`, `dispose`, `readSummary`, `readRequests`, `readMeta`, `recordWebApiCall`, `readWebApi`, `migrationStatus`, `getState`).
+ * @returns {object} store API (`append`, `flushNow`, `dispose`, `readSummary`, `readSessionDetail`, `readRequests`, `readMeta`, `recordWebApiCall`, `readWebApi`, `migrationStatus`, `getState`).
  */
 export function createStore({ ctx, config, diag, logger: _logger, homeDir, profile, profileSource }) {
   const report = (message) => {
@@ -1966,28 +1973,15 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
   }
 
   /**
-   * Read the aggregated summary for a local-day range.
-   * @param {{from?: string, to?: string}} [range] - inclusive day keys (defaults to the detail retention window ending today).
-   * @returns {object} summary payload.
+   * Create an empty summary shell with the temporary aggregation maps
+   * `mergeIntoSummary` fills and `finalizeSummary` removes.
+   * @param {string[]} days - inclusive day keys of the range.
+   * @param {string} start - requested start day (fallback for an empty range).
+   * @param {string} end - requested end day.
+   * @returns {object} summary shell.
    */
-  function readSummary(range = {}) {
-    const end = isValidDayKey(range?.to) ? range.to : dayKey(nowMs())
-    const defaultFrom = shiftDays(end, -(requestRetention - 1))
-    const start = isValidDayKey(range?.from) ? range.from : defaultFrom
-    const days = dayKeysBetween(start, end)
-    /** Queued records not yet flushed, grouped per in-range day (read-only view). @type {Map<string, object>} */
-    const pendingAggregateByDay = new Map()
-    if (queue.length > 0) {
-      const inRange = new Set(days)
-      for (const record of queue) {
-        const day = dayKey(typeof record?.ts === 'number' ? record.ts : nowMs())
-        if (!inRange.has(day)) continue
-        const aggregate = pendingAggregateByDay.get(day) ?? createDayAggregate(day)
-        addRecordToAggregate(aggregate, record)
-        pendingAggregateByDay.set(day, aggregate)
-      }
-    }
-    const summary = {
+  function createSummaryShell(days, start, end) {
+    return {
       generatedAt: nowMs(),
       range: { from: days[0] ?? start, to: days[days.length - 1] ?? end },
       totals: {
@@ -2013,7 +2007,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       byModel: [],
       // Oldest-first daily rows; days with no data at all are omitted so a
       // 30-day query on a young ledger stays small. Queued (unflushed) records
-      // are folded into their day below, exactly like the totals.
+      // are folded into their day by the caller, exactly like the totals.
       byDay: [],
       cache: { input: 0, read: 0, write: 0, hitRate: 0 },
       cost: { amount: 0, priced: false, unpricedRequests: 0, currency: 'CNY' },
@@ -2031,37 +2025,53 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       sessionMap: new Map(),
       modelMap: new Map(),
     }
-    for (const day of days) {
-      const dayTally = createCostTally()
-      let dayRequests = 0
-      let dayPromptTokens = 0
-      let dayOutputTokens = 0
-      let dayEstimatedRequests = 0
-      const parts = [aggregateForRead(day), pendingAggregateByDay.get(day)]
-      for (const part of parts) {
-        if (part === null || part === undefined) continue
-        if (part.costDetailIncomplete === true) summary.data.costDetailIncomplete = true
-        mergeIntoSummary(summary, part)
-        dayRequests += num(part.totals.requests)
-        dayPromptTokens += num(part.totals.promptTokens)
-        dayOutputTokens += num(part.totals.outputTokens)
-        dayEstimatedRequests += num(part.totals.estimatedRequests)
-        mergeAggregateCostToTally(dayTally, part.costByCurrency, part.cost)
-      }
-      if (dayRequests > 0) {
-        summary.byDay.push({
-          day,
-          requests: dayRequests,
-          promptTokens: dayPromptTokens,
-          outputTokens: dayOutputTokens,
-          estimatedRequests: dayEstimatedRequests,
-          cost: finalizeCost(dayTally),
-          // Same shape as `summary.totals.costByCurrency`; amounts are never
-          // summed across currencies, so a mixed day keeps one entry each.
-          costByCurrency: costByCurrencyValue(dayTally),
-        })
-      }
+  }
+
+  /**
+   * Merge one day's aggregate(s) into a summary shell and append its `byDay` row.
+   * @param {object} summary - summary shell (temporary maps included).
+   * @param {string} day - day key.
+   * @param {Array<object | null | undefined>} parts - aggregates for the day.
+   * @returns {void}
+   */
+  function mergeDayIntoSummary(summary, day, parts) {
+    const dayTally = createCostTally()
+    let dayRequests = 0
+    let dayPromptTokens = 0
+    let dayOutputTokens = 0
+    let dayEstimatedRequests = 0
+    for (const part of parts) {
+      if (part === null || part === undefined) continue
+      if (part.costDetailIncomplete === true) summary.data.costDetailIncomplete = true
+      mergeIntoSummary(summary, part)
+      dayRequests += num(part.totals.requests)
+      dayPromptTokens += num(part.totals.promptTokens)
+      dayOutputTokens += num(part.totals.outputTokens)
+      dayEstimatedRequests += num(part.totals.estimatedRequests)
+      mergeAggregateCostToTally(dayTally, part.costByCurrency, part.cost)
     }
+    if (dayRequests > 0) {
+      summary.byDay.push({
+        day,
+        requests: dayRequests,
+        promptTokens: dayPromptTokens,
+        outputTokens: dayOutputTokens,
+        estimatedRequests: dayEstimatedRequests,
+        cost: finalizeCost(dayTally),
+        // Same shape as `summary.totals.costByCurrency`; amounts are never
+        // summed across currencies, so a mixed day keeps one entry each.
+        costByCurrency: costByCurrencyValue(dayTally),
+      })
+    }
+  }
+
+  /**
+   * Finalize a summary shell: derive the public arrays, rates, and cost blocks,
+   * then drop the temporary maps.
+   * @param {object} summary - summary shell (mutated).
+   * @returns {object} the same summary.
+   */
+  function finalizeSummary(summary) {
     const sessions = [...summary.sessionMap.values()].map(entry => ({
       sessionId: entry.sessionId,
       parentSessionId: entry.parentSessionId,
@@ -2104,17 +2114,6 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       : 0
     summary.totals.costByCurrency = costByCurrencyValue(summary.costTally)
     summary.cost = finalizeCost(summary.costTally)
-    // Web API call counters live in their own per-day files and are priced as a
-    // separate estimate. `readWebApi` also carries the exact unattributed
-    // remainder; the spread below keeps it next to the unchanged totals. A
-    // failure here must never break the token summary.
-    try {
-      const webApi = readWebApi({ from: summary.range.from, to: summary.range.to })
-      summary.webApi = { ...webApi, cost: webApiCost(webApi) }
-    } catch (error) {
-      report(`web API summary failed: ${error instanceof Error ? error.message : String(error)}`)
-      summary.webApi = emptyWebApiSummary(webApiPricing.currency)
-    }
     delete summary.costTally
     delete summary.purposeCostMap
     delete summary.sessionMap
@@ -2123,12 +2122,419 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
   }
 
   /**
+   * Attach the range's web API counters to a finalized summary.
+   *
+   * `readWebApi` also carries the exact unattributed remainder; the spread below
+   * keeps it next to the unchanged totals. A failure here must never break the
+   * token summary.
+   * @param {object} summary - finalized summary (mutated).
+   * @returns {void}
+   */
+  function attachWebApiSummary(summary) {
+    try {
+      const webApi = readWebApi({ from: summary.range.from, to: summary.range.to })
+      summary.webApi = { ...webApi, cost: webApiCost(webApi) }
+    } catch (error) {
+      report(`web API summary failed: ${error instanceof Error ? error.message : String(error)}`)
+      summary.webApi = emptyWebApiSummary(webApiPricing.currency)
+    }
+  }
+
+  /**
+   * Build the aggregated summary for a local-day range without the web API
+   * counters. `readSummary` attaches those; the session drill-down filters them
+   * by the selected sessions instead.
+   * @param {{from?: string, to?: string}} [range] - inclusive day keys (defaults to the detail retention window ending today).
+   * @returns {object} finalized summary without `webApi`.
+   */
+  function buildSummaryForRange(range = {}) {
+    const end = isValidDayKey(range?.to) ? range.to : dayKey(nowMs())
+    const defaultFrom = shiftDays(end, -(requestRetention - 1))
+    const start = isValidDayKey(range?.from) ? range.from : defaultFrom
+    const days = dayKeysBetween(start, end)
+    /** Queued records not yet flushed, grouped per in-range day (read-only view). @type {Map<string, object>} */
+    const pendingAggregateByDay = new Map()
+    if (queue.length > 0) {
+      const inRange = new Set(days)
+      for (const record of queue) {
+        const day = dayKey(typeof record?.ts === 'number' ? record.ts : nowMs())
+        if (!inRange.has(day)) continue
+        const aggregate = pendingAggregateByDay.get(day) ?? createDayAggregate(day)
+        addRecordToAggregate(aggregate, record)
+        pendingAggregateByDay.set(day, aggregate)
+      }
+    }
+    const summary = createSummaryShell(days, start, end)
+    for (const day of days) {
+      mergeDayIntoSummary(summary, day, [aggregateForRead(day), pendingAggregateByDay.get(day)])
+    }
+    return finalizeSummary(summary)
+  }
+
+  /**
+   * Read the aggregated summary for a local-day range.
+   * @param {{from?: string, to?: string}} [range] - inclusive day keys (defaults to the detail retention window ending today).
+   * @returns {object} summary payload.
+   */
+  function readSummary(range = {}) {
+    const summary = buildSummaryForRange(range)
+    attachWebApiSummary(summary)
+    return summary
+  }
+
+  /**
+   * Resolve the selected session row and its optional descendant closure from
+   * the full-range `bySession` rows.
+   *
+   * `children` is always the direct-child list (independent of
+   * `includeDescendants`, which only controls how much the summary scans).
+   * The descendant walk follows `parentSessionId` downward and is both
+   * cycle-safe (a visited-id set) and depth-safe (a bounded frontier). The
+   * selected session is always first in `sessionIds`; descendants are added
+   * breadth-first in the input row order and the result is capped at
+   * `MAX_SESSION_DETAIL_IDS`.
+   * @param {object[]} rows - full-range `bySession` rows.
+   * @param {string} sessionId - selected session id.
+   * @param {boolean} includeDescendants - whether to resolve the subtree.
+   * @returns {{selected: object | null, children: object[], sessionIds: string[]}} selection.
+   */
+  function resolveSessionSelection(rows, sessionId, includeDescendants) {
+    const byId = new Map()
+    for (const row of rows) {
+      const id = typeof row?.sessionId === 'string' ? row.sessionId : ''
+      if (id.length > 0 && !byId.has(id)) byId.set(id, row)
+    }
+    const selected = byId.get(sessionId) ?? null
+    const children = rows.filter(row => typeof row?.sessionId === 'string'
+      && row.sessionId !== sessionId
+      && row.parentSessionId === sessionId)
+    const sessionIds = [sessionId]
+    if (selected !== null && includeDescendants) {
+      const included = new Set(sessionIds)
+      let frontier = [sessionId]
+      while (frontier.length > 0 && sessionIds.length < MAX_SESSION_DETAIL_IDS) {
+        const next = []
+        for (const parentId of frontier) {
+          for (const row of rows) {
+            if (row?.parentSessionId !== parentId) continue
+            const childId = typeof row.sessionId === 'string' ? row.sessionId : ''
+            if (childId.length === 0 || included.has(childId)) continue
+            included.add(childId)
+            sessionIds.push(childId)
+            next.push(childId)
+            if (sessionIds.length >= MAX_SESSION_DETAIL_IDS) break
+          }
+          if (sessionIds.length >= MAX_SESSION_DETAIL_IDS) break
+        }
+        frontier = next
+      }
+    }
+    return { selected, children, sessionIds }
+  }
+
+  /**
+   * Build a session-scoped summary from retained detail rows.
+   *
+   * Every detail file in the range is read once; only records whose
+   * `sessionId` is selected are kept (deduplicated by `id` across days), then
+   * the in-memory queue is folded in so the drill-down shows unflushed records
+   * too. Each day with selected rows becomes a normal daily aggregate, so the
+   * summary shell, every breakdown, `byDay`, cache counters, and per-entity
+   * cost share the exact `readSummary` code path.
+   * @param {string[]} days - range day keys.
+   * @param {string} start - requested start day.
+   * @param {string} end - requested end day.
+   * @param {string[]} sessionIds - selected session ids.
+   * @returns {{summary: object, detailRequests: number}} filtered summary and the number of detail requests it covers.
+   */
+  function buildSessionDetailSummary(days, start, end, sessionIds) {
+    const idSet = new Set(sessionIds)
+    const daySet = new Set(days)
+    /** @type {Map<string, object[]>} */
+    const recordsByDay = new Map()
+    const seenIds = new Set()
+    const addRecord = (day, record) => {
+      const id = typeof record?.id === 'string' ? record.id : null
+      if (id !== null) {
+        if (seenIds.has(id)) return
+        seenIds.add(id)
+      }
+      const list = recordsByDay.get(day)
+      if (list === undefined) recordsByDay.set(day, [record])
+      else list.push(record)
+    }
+    for (const day of days) {
+      let text
+      try {
+        text = fs.readFileSync(requestsPath(day), 'utf8')
+      } catch {
+        // A missing (or unreadable) detail file is the normal partial-detail
+        // case: keep the days that do exist and let the caller flag it.
+        continue
+      }
+      for (const line of text.split('\n')) {
+        if (line.length === 0) continue
+        let record
+        try {
+          record = JSON.parse(line)
+        } catch {
+          continue
+        }
+        if (record === null || typeof record !== 'object' || record.v !== 1) continue
+        if (typeof record.sessionId !== 'string' || !idSet.has(record.sessionId)) continue
+        addRecord(day, record)
+      }
+    }
+    if (queue.length > 0) {
+      for (const record of queue) {
+        if (record === null || typeof record !== 'object' || record.v !== 1) continue
+        if (typeof record.sessionId !== 'string' || !idSet.has(record.sessionId)) continue
+        const day = dayKey(typeof record.ts === 'number' ? record.ts : nowMs())
+        if (!daySet.has(day)) continue
+        addRecord(day, record)
+      }
+    }
+    const summary = createSummaryShell(days, start, end)
+    let detailRequests = 0
+    for (const day of days) {
+      const records = recordsByDay.get(day)
+      if (records === undefined || records.length === 0) continue
+      const aggregate = aggregateFromRecords(day, records)
+      detailRequests += num(aggregate.totals.requests)
+      mergeDayIntoSummary(summary, day, [aggregate])
+    }
+    finalizeSummary(summary)
+    return { summary, detailRequests }
+  }
+
+  /**
+   * Synthesize a summary from selected `bySession` rows when no detail row is
+   * retained (the request detail was pruned before the daily aggregates).
+   *
+   * The cards (totals, cost, cache, `bySession`) come from the selected rows;
+   * every per-purpose/category/model/day breakdown is empty because a session
+   * row does not retain that split. The synthetic aggregate is merged through
+   * `mergeIntoSummary`, so the cost/cache/totals shapes match a detail summary.
+   * @param {string[]} days - range day keys.
+   * @param {string} start - requested start day.
+   * @param {string} end - requested end day.
+   * @param {object[]} rows - selected full-range `bySession` rows.
+   * @returns {object} finalized summary.
+   */
+  function synthesizeSummaryFromSessions(days, start, end, rows) {
+    const summary = createSummaryShell(days, start, end)
+    if (rows.length > 0) {
+      const aggregate = createDayAggregate('selected-sessions')
+      const tally = aggregateCostTally(aggregate)
+      for (const row of rows) {
+        const sessionId = typeof row?.sessionId === 'string' ? row.sessionId : ''
+        if (sessionId.length === 0) continue
+        const requests = num(row.requests)
+        const promptTokens = num(row.promptTokens)
+        const outputTokens = num(row.outputTokens)
+        const cache = row.cache !== null && typeof row.cache === 'object' && !Array.isArray(row.cache)
+          ? row.cache
+          : {}
+        const cacheInput = num(cache.input)
+        const cacheRead = num(cache.read)
+        const cacheWrite = num(cache.write)
+        aggregate.totals.requests += requests
+        aggregate.totals.attempts += requests
+        aggregate.totals.measuredRequests += requests
+        aggregate.totals.promptTokens += promptTokens
+        aggregate.totals.outputTokens += outputTokens
+        aggregate.totals.totalTokens += promptTokens + outputTokens
+        // `bySession` rows do not retain the measured/estimated split; a row
+        // only exists for persisted requests, so count it as measured.
+        aggregate.totals.measuredPromptTokens += promptTokens
+        aggregate.totals.measuredOutputTokens += outputTokens
+        aggregate.cache.input += cacheInput
+        aggregate.cache.read += cacheRead
+        aggregate.cache.write += cacheWrite
+        aggregate.bySession[sessionId] = {
+          sessionId,
+          parentSessionId: typeof row.parentSessionId === 'string' ? row.parentSessionId : null,
+          depth: Number.isInteger(row.depth) ? row.depth : 0,
+          promptTokens,
+          outputTokens,
+          requests,
+          cache: { input: cacheInput, read: cacheRead, write: cacheWrite },
+          cost: row.cost !== null && typeof row.cost === 'object' && !Array.isArray(row.cost)
+            ? row.cost
+            : { amount: 0, priced: false, currency: DEFAULT_CURRENCY },
+        }
+        mergeFlatCostToTally(tally, row.cost)
+      }
+      aggregate.cost = finalizeCost(tally)
+      mergeIntoSummary(summary, aggregate)
+    }
+    return finalizeSummary(summary)
+  }
+
+  /**
+   * Read Web API counters for an explicit set of sessions.
+   *
+   * The range `bySession` rows are capped at 100, so a drill-down cannot filter
+   * them: a session beyond the cap would lose real calls. Scan the per-day
+   * session buckets instead and sum only the selected ids. Only attributed
+   * calls are returned; the range `unattributed` remainder is never folded into
+   * a session.
+   * @param {{from: string, to: string}} range - inclusive day keys.
+   * @param {string[]} sessionIds - selected session ids.
+   * @returns {{search: object, fetch: object, calls: object, cost: {amount: number, currency: string, priced: boolean}, bySession: object[]}} filtered block.
+   */
+  function readSessionWebApi(range, sessionIds) {
+    const idSet = new Set(sessionIds)
+    const totals = emptyWebApiCounters()
+    /** @type {Map<string, object>} */
+    const sessionTotals = new Map()
+    for (const day of dayKeysBetween(range.from, range.to)) {
+      const entry = loadWebApiDay(day)
+      if (entry === null) continue
+      for (const [sessionId, counters] of mapEntries(entry.sessions)) {
+        if (!idSet.has(sessionId)) continue
+        let target = sessionTotals.get(sessionId)
+        if (target === undefined) {
+          target = { sessionId, ...emptyWebApiCounters() }
+          sessionTotals.set(sessionId, target)
+        }
+        for (const tool of WEB_API_TOOLS) {
+          target[tool].ok += num(counters?.[tool]?.ok)
+          target[tool].failed += num(counters?.[tool]?.failed)
+        }
+      }
+    }
+    const rows = []
+    for (const entry of sessionTotals.values()) {
+      for (const tool of WEB_API_TOOLS) {
+        entry[tool].total = entry[tool].ok + entry[tool].failed
+        totals[tool].ok += entry[tool].ok
+        totals[tool].failed += entry[tool].failed
+      }
+      entry.calls.ok = entry.search.ok + entry.fetch.ok
+      entry.calls.failed = entry.search.failed + entry.fetch.failed
+      entry.calls.total = entry.calls.ok + entry.calls.failed
+      rows.push({
+        sessionId: entry.sessionId,
+        search: entry.search,
+        fetch: entry.fetch,
+        calls: entry.calls,
+        cost: webApiCost(entry),
+      })
+    }
+    for (const tool of WEB_API_TOOLS) totals[tool].total = totals[tool].ok + totals[tool].failed
+    totals.calls.ok = totals.search.ok + totals.fetch.ok
+    totals.calls.failed = totals.search.failed + totals.fetch.failed
+    totals.calls.total = totals.calls.ok + totals.calls.failed
+    rows.sort((left, right) => (right.calls.total - left.calls.total)
+      || (right.search.total - left.search.total)
+      || (left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0))
+    return {
+      ...totals,
+      cost: webApiCost(totals),
+      bySession: rows,
+    }
+  }
+
+  /**
+   * Read a session-scoped drill-down for one local-day range.
+   *
+   * The selected session row and its direct children come from the full-range
+   * `bySession` rows (before any filtering). The returned `summary` is
+   * restricted to the selected session plus (when `includeDescendants`) every
+   * session reachable through `parentSessionId`; it is rebuilt from retained
+   * detail rows so every breakdown stays exact, with queued records folded in.
+   *
+   * When the selected session is unknown the result carries zeroed cards and
+   * `detailReason: 'session-not-found'`. When detail rows exist for fewer
+   * requests than the selected `bySession` rows report, `detailPartial` is set;
+   * when no detail row survives at all, the summary cards are synthesized from
+   * the selected `bySession` rows and every breakdown is empty.
+   * @param {{from?: string, to?: string, sessionId?: string, includeDescendants?: boolean}} [query] - drill-down query.
+   * @returns {{generatedAt: number, range: {from: string, to: string}, sessionId: string, includeDescendants: boolean, detailAvailable: boolean, detailPartial: boolean, detailReason: string|null, session: object|null, children: object[], sessionIds: string[], summary: object, webApi: object}} drill-down payload.
+   */
+  function readSessionDetail(query = {}) {
+    const end = isValidDayKey(query?.to) ? query.to : dayKey(nowMs())
+    const start = isValidDayKey(query?.from) ? query.from : shiftDays(end, -(requestRetention - 1))
+    const days = dayKeysBetween(start, end)
+    const sessionId = typeof query?.sessionId === 'string' && query.sessionId.length > 0 ? query.sessionId : ''
+    const includeDescendants = query?.includeDescendants !== false
+    // The full-range summary supplies the unfiltered session rows (and the
+    // daily aggregates); it is built without the Web API block because the
+    // drill-down reads and filters those counters itself.
+    const full = buildSummaryForRange({ from: start, to: end })
+    const selection = resolveSessionSelection(full.bySession, sessionId, includeDescendants)
+    const selectedIdSet = new Set(selection.sessionIds)
+    const selectedRows = full.bySession.filter(row => selectedIdSet.has(row.sessionId))
+    const expectedRequests = selectedRows.reduce((sum, row) => sum + num(row.requests), 0)
+
+    let summary
+    let detailRequests = 0
+    if (selection.selected === null) {
+      // Unknown session: nothing is known about it, so the dashboard gets an
+      // empty summary rather than another session's numbers.
+      summary = synthesizeSummaryFromSessions(days, start, end, [])
+    } else {
+      const built = buildSessionDetailSummary(days, start, end, selection.sessionIds)
+      detailRequests = built.detailRequests
+      summary = detailRequests > 0
+        ? built.summary
+        : synthesizeSummaryFromSessions(days, start, end, selectedRows)
+    }
+
+    let webApi
+    try {
+      webApi = readSessionWebApi({ from: summary.range.from, to: summary.range.to }, selection.sessionIds)
+    } catch (error) {
+      report(`web API session drill-down failed: ${error instanceof Error ? error.message : String(error)}`)
+      webApi = {
+        ...emptyWebApiCounters(),
+        cost: { amount: 0, currency: webApiPricing.currency, priced: false },
+        bySession: [],
+      }
+    }
+    // `summary` keeps the `readSummary` shape, so its Web API block stays
+    // present but restricted; the range `unattributed` remainder is excluded
+    // (it belongs to no session) and therefore reads as zero here.
+    summary.webApi = {
+      ...webApi,
+      unattributed: {
+        ...emptyWebApiCounters(),
+        cost: { amount: 0, currency: webApiPricing.currency, priced: false },
+      },
+    }
+
+    const detailAvailable = selection.selected !== null && detailRequests > 0
+    const detailPartial = detailAvailable && detailRequests < expectedRequests
+    let detailReason = null
+    if (selection.selected === null) detailReason = 'session-not-found'
+    else if (!detailAvailable) detailReason = 'no-detail'
+    else if (detailPartial) detailReason = 'partial-detail'
+
+    return {
+      generatedAt: nowMs(),
+      range: summary.range,
+      sessionId,
+      includeDescendants,
+      detailAvailable,
+      detailPartial,
+      detailReason,
+      session: selection.selected,
+      children: selection.children,
+      sessionIds: selection.sessionIds,
+      summary,
+      webApi,
+    }
+  }
+
+  /**
    * Read per-request detail rows, newest first.
    *
-   * Filters compose: `purpose` and `sessionId` are exact matches, and either
-   * applies to the selected `date` or `from`/`to` day range. `total` counts the
-   * filtered rows before pagination, so it stays correct for any combination.
-   * @param {{date?: string, from?: string, to?: string, limit?: number, offset?: number, purpose?: string, sessionId?: string}} [query] - detail query.
+   * Filters compose: `purpose` and `sessionId` are exact matches, `sessionIds`
+   * is an exact set match, and either applies to the selected `date` or
+   * `from`/`to` day range. `total` counts the filtered rows before pagination,
+   * so it stays correct for any combination.
+   * @param {{date?: string, from?: string, to?: string, limit?: number, offset?: number, purpose?: string, sessionId?: string, sessionIds?: string[]}} [query] - detail query.
    * @returns {{items: object[], total: number}} page plus the filtered total.
    */
   function readRequests(query = {}) {
@@ -2136,6 +2542,12 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
     const offset = Number.isInteger(query?.offset) && query.offset > 0 ? query.offset : 0
     const purposeFilter = typeof query?.purpose === 'string' && query.purpose.length > 0 ? query.purpose : null
     const sessionIdFilter = typeof query?.sessionId === 'string' && query.sessionId.length > 0 ? query.sessionId : null
+    // An exact set filter used by the session drill-down links; the store
+    // ignores an empty/invalid array defensively (the RPC endpoint rejects it).
+    const sessionIdsFilter = Array.isArray(query?.sessionIds)
+      ? new Set(query.sessionIds.filter(id => typeof id === 'string' && id.length > 0))
+      : null
+    const sessionIdsFilterActive = sessionIdsFilter !== null && sessionIdsFilter.size > 0
     let days
     if (isValidDayKey(query?.date)) {
       days = [query.date]
@@ -2165,6 +2577,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
         // Exact match on the stored session id; a record without one never
         // matches a non-empty filter.
         if (sessionIdFilter !== null && record.sessionId !== sessionIdFilter) continue
+        if (sessionIdsFilterActive && !sessionIdsFilter.has(record.sessionId)) continue
         items.push(record)
       }
     }
@@ -2270,6 +2683,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
     flushNow: flush,
     dispose,
     readSummary,
+    readSessionDetail,
     readRequests,
     readMeta,
     recordWebApiCall,

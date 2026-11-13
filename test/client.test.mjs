@@ -4186,3 +4186,968 @@ test('M2.10 older Hosts without the group and unknown groups keep working', () =
 })
 
 
+
+// ---------------------------------------------------------------------------
+// M3 — single-session drill-down
+// ---------------------------------------------------------------------------
+
+const m3BySession = () => [
+  { sessionId: 'parent-session', parentSessionId: null, depth: 0, promptTokens: 300, outputTokens: 100, tokens: 400, requests: 2 },
+  {
+    sessionId: 'root-session',
+    parentSessionId: 'parent-session',
+    depth: 1,
+    promptTokens: 200,
+    outputTokens: 80,
+    tokens: 280,
+    requests: 2,
+    cache: { input: 10, read: 200, write: 10 },
+    cost: { amount: 0.2, currency: 'CNY', priced: true },
+  },
+  {
+    sessionId: 'child-session',
+    parentSessionId: 'root-session',
+    depth: 2,
+    promptTokens: 100,
+    outputTokens: 40,
+    tokens: 140,
+    requests: 1,
+    cost: { amount: 0.05, currency: 'CNY', priced: true },
+  },
+]
+
+const m3Titles = {
+  'parent-session': { displayTitle: '父会话标题' },
+  'root-session': { displayTitle: '根会话标题' },
+  'child-session': { displayTitle: '子会话标题' },
+}
+
+const m3SummaryRaw = () => ({
+  range: { from: '2026-11-01', to: '2026-11-07' },
+  totals: { promptTokens: 600, outputTokens: 220, totalTokens: 820, requests: 5, measuredRequests: 5 },
+  byPurpose: { chat: { requests: 5, promptTokens: 600, outputTokens: 220 } },
+  byCategory: { user: 400, 'tool-result:other:read': 200 },
+  byCategoryGroup: { user: 400, 'tool-result': 200 },
+  byToolGroup: { memory: 500, skill: 100 },
+  bySession: m3BySession(),
+  byModel: [{ provider: 'deepseek-official', model: 'deepseek-flash', requests: 5, promptTokens: 600, outputTokens: 220, tokens: 820 }],
+  byDay: [{ day: '2026-11-05', promptTokens: 600, outputTokens: 220, requests: 5 }],
+  cache: { input: 10, read: 200, write: 10, hitRate: 0.9 },
+  cost: { amount: 0.25, currency: 'CNY', priced: true, unpricedRequests: 0 },
+  webApi: {
+    search: { ok: 2, failed: 0, total: 2 },
+    fetch: { ok: 1, failed: 0, total: 1 },
+    calls: { ok: 3, failed: 0, total: 3 },
+    cost: { amount: 0.015, currency: 'CNY', priced: true },
+    bySession: [{
+      sessionId: 'root-session',
+      search: { ok: 2, failed: 0, total: 2 },
+      fetch: { ok: 1, failed: 0, total: 1 },
+      calls: { ok: 3, failed: 0, total: 3 },
+      cost: { amount: 0.015, currency: 'CNY', priced: true },
+    }],
+    unattributed: {
+      search: { ok: 9, failed: 0, total: 9 },
+      fetch: { ok: 0, failed: 0, total: 0 },
+      calls: { ok: 9, failed: 0, total: 9 },
+      cost: { amount: 0.045, currency: 'CNY', priced: true },
+    },
+  },
+})
+
+const m3DetailRaw = () => ({
+  generatedAt: 1700000000000,
+  range: { from: '2026-11-01', to: '2026-11-07' },
+  sessionId: 'root-session',
+  includeDescendants: true,
+  detailAvailable: true,
+  detailPartial: false,
+  session: m3BySession()[1],
+  children: [m3BySession()[2]],
+  sessionIds: ['root-session', 'child-session'],
+  summary: {
+    totals: { promptTokens: 300, outputTokens: 120, totalTokens: 420, requests: 3 },
+    byPurpose: { chat: { requests: 3, promptTokens: 300, outputTokens: 120 } },
+    byCategory: { user: 200, 'tool-result:other:read': 100 },
+    byCategoryGroup: { user: 200, 'tool-result': 100 },
+    byToolGroup: { memory: 260 },
+    byModel: [{
+      provider: 'deepseek-official',
+      model: 'deepseek-flash',
+      requests: 3,
+      promptTokens: 300,
+      outputTokens: 120,
+      tokens: 420,
+      cost: { amount: 0.25, currency: 'CNY', priced: true },
+    }],
+    byDay: [{ day: '2026-11-05', promptTokens: 300, outputTokens: 120, requests: 3 }],
+    bySession: [
+      { sessionId: 'root-session', parentSessionId: 'parent-session', depth: 1, promptTokens: 200, outputTokens: 80, tokens: 280, requests: 2 },
+      { sessionId: 'child-session', parentSessionId: 'root-session', depth: 2, promptTokens: 100, outputTokens: 40, tokens: 140, requests: 1, cost: { amount: 0.05, currency: 'CNY', priced: true } },
+      { sessionId: 'grandchild-session', parentSessionId: 'child-session', depth: 3, promptTokens: 50, outputTokens: 10, tokens: 60, requests: 1 },
+    ],
+    cache: { input: 10, read: 200, write: 10, hitRate: 0.9 },
+    cost: { amount: 0.25, currency: 'CNY', priced: true, unpricedRequests: 0 },
+  },
+  webApi: {
+    search: { ok: 2, failed: 0, total: 2 },
+    fetch: { ok: 1, failed: 0, total: 1 },
+    calls: { ok: 3, failed: 0, total: 3 },
+    cost: { amount: 0.015, currency: 'CNY', priced: true },
+    bySession: [{
+      sessionId: 'root-session',
+      search: { ok: 2, failed: 0, total: 2 },
+      fetch: { ok: 1, failed: 0, total: 1 },
+      calls: { ok: 3, failed: 0, total: 3 },
+      cost: { amount: 0.015, currency: 'CNY', priced: true },
+    }],
+  },
+})
+
+const m3RpcSpy = () => {
+  const calls = []
+  const rpc = {
+    async call(endpoint, payload) {
+      calls.push({ endpoint, payload })
+      return { ok: true, value: {} }
+    },
+    getChannel() {
+      return '/token-attribution'
+    },
+    setChannel() {},
+  }
+  return { calls, rpc }
+}
+
+test('M3 normalizeSessionDetail is defensive and falls back to retained aggregates', () => {
+  const plugin = captured.factory(fakeRequire)
+  const { normalizeSessionDetail, sessionDetailEmpty, normalizeSessionIdList } = plugin.__test
+
+  const empty = normalizeSessionDetail(null)
+  assert.equal(empty.generatedAt, 0)
+  assert.equal(empty.sessionId, '')
+  assert.equal(empty.includeDescendants, true, 'subtree mode is the default')
+  assert.equal(empty.detailAvailable, true, 'only an explicit false selects the fallback')
+  assert.equal(empty.detailPartial, false)
+  assert.equal(empty.detailReason, null)
+  assert.equal(empty.session, null)
+  assert.deepEqual(empty.children, [])
+  assert.deepEqual(empty.sessionIds, [])
+  assert.equal(empty.summary.totals.requests, 0)
+  assert.equal(empty.webApi.calls.total, 0)
+  assert.equal(empty.webApi.unattributed.calls.total, 0)
+  assert.equal(sessionDetailEmpty(empty), true)
+
+  const detail = normalizeSessionDetail(m3DetailRaw())
+  assert.equal(detail.sessionId, 'root-session')
+  assert.equal(detail.session.sessionId, 'root-session')
+  assert.equal(detail.session.requests, 2)
+  assert.equal(detail.children.length, 1)
+  assert.equal(detail.children[0].sessionId, 'child-session')
+  assert.deepEqual(detail.sessionIds, ['root-session', 'child-session'])
+  assert.equal(detail.summary.totals.totalTokens, 420)
+  assert.equal(detail.summary.byPurpose.chat.tokens, 420)
+  assert.equal(detail.webApi.calls.total, 3)
+  assert.equal(detail.webApi.unattributed.calls.total, 0, 'the range-level unattributed remainder is dropped')
+  assert.equal(sessionDetailEmpty(detail), false)
+
+  const derivedIds = normalizeSessionDetail({
+    sessionId: 'root-session',
+    session: m3BySession()[1],
+    children: [m3BySession()[2]],
+  })
+  assert.deepEqual(derivedIds.sessionIds, ['root-session', 'child-session'])
+  assert.equal(derivedIds.summary.totals.requests, 2, 'a summary is synthesized from the session row')
+  assert.equal(derivedIds.summary.totals.totalTokens, 280)
+
+  const scoped = normalizeSessionDetail({
+    sessionId: 'root-session',
+    sessionIds: ['root-session'],
+    summary: {
+      totals: { requests: 1 },
+      webApi: {
+        search: { ok: 99, failed: 0, total: 99 },
+        calls: { ok: 99, failed: 0, total: 99 },
+        cost: { amount: 9.9, currency: 'CNY', priced: true },
+        bySession: [{
+          sessionId: 'root-session',
+          search: { ok: 2, failed: 0, total: 2 },
+          fetch: { ok: 1, failed: 0, total: 1 },
+          calls: { ok: 3, failed: 0, total: 3 },
+          cost: { amount: 0.015, currency: 'CNY', priced: true },
+        }, {
+          sessionId: 'other-session',
+          search: { ok: 50, failed: 0, total: 50 },
+          calls: { ok: 50, failed: 0, total: 50 },
+        }],
+        unattributed: { calls: { ok: 7, failed: 0, total: 7 } },
+      },
+    },
+  })
+  assert.equal(scoped.webApi.bySession.length, 1)
+  assert.equal(scoped.webApi.calls.total, 3, 'totals are re-derived from the filtered rows')
+  assert.equal(scoped.webApi.unattributed.calls.total, 0)
+
+  const fallback = normalizeSessionDetail({
+    sessionId: 'root-session',
+    detailAvailable: false,
+    detailReason: 'detail-expired',
+    range: { from: '2026-11-01', to: '2026-11-07' },
+    session: m3BySession()[1],
+    summary: {
+      totals: { promptTokens: 200, outputTokens: 80, totalTokens: 280, requests: 2 },
+      cost: { amount: 0.2, currency: 'CNY', priced: true },
+    },
+  })
+  assert.equal(fallback.detailAvailable, false)
+  assert.equal(fallback.detailReason, 'detail-expired')
+  assert.equal(fallback.summary.totals.totalTokens, 280)
+  assert.equal(fallback.sessionIds[0], 'root-session')
+
+  // Mirrors the Host's `session-not-found` payload: the echoed id must not
+  // stop the drill-down from showing its "session vanished" state.
+  const vanished = normalizeSessionDetail({
+    sessionId: 'gone-session',
+    detailAvailable: false,
+    detailReason: 'session-not-found',
+    session: null,
+    children: [],
+    sessionIds: ['gone-session'],
+    summary: { totals: {} },
+    webApi: { bySession: [] },
+  })
+  assert.equal(sessionDetailEmpty(vanished), true)
+  assert.equal(vanished.sessionIds[0], 'gone-session')
+
+  const vanishedWithChild = normalizeSessionDetail({
+    sessionId: 'gone-session',
+    detailAvailable: false,
+    detailReason: 'session-not-found',
+    session: null,
+    children: [m3BySession()[2]],
+    sessionIds: ['gone-session', 'child-session'],
+    summary: { totals: {} },
+    webApi: { bySession: [] },
+  })
+  assert.equal(sessionDetailEmpty(vanishedWithChild), true, 'a vanished parent with surviving children is still empty')
+  assert.equal(vanishedWithChild.children[0].sessionId, 'child-session')
+
+  assert.deepEqual(normalizeSessionIdList(['a', 'a', ' b ', 7, '', null]), ['a', 'b'])
+  assert.deepEqual(normalizeSessionIdList(null), [])
+})
+
+test('M3 session drill payloads and breadcrumb chain are stable', () => {
+  const {
+    sessionDetailPayload,
+    sessionRequestsPayload,
+    sessionBreadcrumb,
+    drillReducer,
+    createDrillState,
+    initialDrillState,
+    normalizeSessionDetail,
+  } = captured.factory(fakeRequire).__test
+
+  assert.deepEqual(sessionDetailPayload('7d', { sessionId: ' root-session ', includeDescendants: true }), {
+    range: '7d',
+    sessionId: 'root-session',
+    includeDescendants: true,
+  })
+  assert.deepEqual(sessionDetailPayload({ label: '30d' }, { sessionId: 'x', includeDescendants: false }), {
+    range: '30d',
+    sessionId: 'x',
+    includeDescendants: false,
+  })
+  assert.equal(sessionDetailPayload('nope', { sessionId: 'x' }).range, 'today')
+
+  assert.deepEqual(sessionRequestsPayload({ from: '2026-11-01', to: '2026-11-07' }, {
+    limit: 20,
+    offset: 20,
+    sessionId: 'root-session',
+    includeDescendants: true,
+    sessionIds: ['root-session', 'child-session', 'root-session'],
+  }), {
+    from: '2026-11-01',
+    to: '2026-11-07',
+    limit: 20,
+    offset: 20,
+    sessionIds: ['root-session', 'child-session'],
+  })
+  assert.deepEqual(sessionRequestsPayload({ from: '2026-11-01', to: '2026-11-07' }, {
+    limit: 20,
+    offset: 0,
+    sessionId: 'root-session',
+    includeDescendants: false,
+    sessionIds: ['root-session', 'child-session'],
+  }), {
+    from: '2026-11-01',
+    to: '2026-11-07',
+    limit: 20,
+    offset: 0,
+    sessionId: 'root-session',
+  }, 'single-session mode uses the legacy sessionId filter')
+  assert.equal(
+    Object.hasOwn(sessionRequestsPayload(null, { includeDescendants: true, sessionId: '' }), 'sessionId'),
+    false,
+    'no empty session filter is sent',
+  )
+
+  const path = sessionBreadcrumb(m3BySession(), 'root-session')
+  assert.deepEqual(path.map(entry => entry.sessionId), ['parent-session', 'root-session'])
+  assert.deepEqual(sessionBreadcrumb(m3BySession(), 'unknown-session'), [{ sessionId: 'unknown-session', parentSessionId: null }])
+  const cycle = [
+    { sessionId: 'a', parentSessionId: 'b' },
+    { sessionId: 'b', parentSessionId: 'a' },
+  ]
+  assert.ok(sessionBreadcrumb(cycle, 'a').length <= 2, 'a parent cycle ends the walk')
+
+  let state = createDrillState()
+  assert.equal(state.sessionId, null)
+  assert.equal(state.includeDescendants, true)
+  state = drillReducer(state, { type: 'open', sessionId: 'root-session' })
+  assert.equal(state.sessionId, 'root-session')
+  assert.equal(state.includeDescendants, true)
+  assert.equal(state.status, 'loading')
+  state = drillReducer(state, { type: 'toggle', includeDescendants: false })
+  assert.equal(state.includeDescendants, false)
+  assert.equal(state.data, null)
+  state = drillReducer(state, { type: 'loaded', data: normalizeSessionDetail(m3DetailRaw()) })
+  assert.equal(state.status, 'ready')
+  assert.equal(state.sessionId, 'root-session')
+  assert.equal(state.rangeKey, '2026-11-01|2026-11-07')
+  state = drillReducer(state, { type: 'range', rangeKey: '2026-11-02|2026-11-08' })
+  assert.equal(state.status, 'loading', 'a range change waits for the refetch')
+  assert.equal(state.data, null)
+  assert.equal(state.rangeKey, '2026-11-02|2026-11-08')
+  state = drillReducer(state, { type: 'error', error: { code: 'transport', message: 'down', details: {} } })
+  assert.equal(state.sessionId, null, 'an error clears the selection')
+  assert.equal(state.error.code, 'transport')
+  assert.equal(state.lastSessionId, 'root-session', 'the retry warning remembers the session')
+  state = drillReducer(createDrillState(), { type: 'open', sessionId: 'x', includeDescendants: true })
+  state = drillReducer(state, { type: 'close' })
+  assert.equal(state.sessionId, null)
+  assert.equal(state.data, null)
+
+  const emptyLoaded = drillReducer(
+    drillReducer(createDrillState(), { type: 'open', sessionId: 'gone' }),
+    { type: 'loaded', data: normalizeSessionDetail({ sessionId: 'gone', summary: { totals: {} } }) },
+  )
+  assert.equal(emptyLoaded.status, 'empty')
+
+  const hydrated = initialDrillState({
+    sessionId: 'root-session',
+    includeDescendants: false,
+    data: m3DetailRaw(),
+  })
+  assert.equal(hydrated.sessionId, 'root-session')
+  assert.equal(hydrated.status, 'ready')
+  assert.equal(hydrated.includeDescendants, false)
+  assert.equal(hydrated.data.sessionId, 'root-session')
+  assert.equal(initialDrillState(null).sessionId, null)
+})
+
+test('M3 session titles open the drill-down while the chevron stays separate', () => {
+  const { components } = captured.factory(fakeRequire).__test
+  const t = makeT26('zh')
+  const opened = []
+  const toggled = []
+  const table = components.SessionTreeTable({
+    bySession: m3BySession(),
+    currency: 'CNY',
+    t,
+    sessionTitles: m3Titles,
+    expanded: { 'parent-session': true, 'root-session': true },
+    onToggle: key => toggled.push(key),
+    onOpen: sessionId => opened.push(sessionId),
+  })
+  const nodes = flattenM26(table)
+  const openButtons = nodes.filter(node => node.props?.['data-dsh-part'] === 'session-open')
+  assert.equal(openButtons.length, 3, 'every visible session title is clickable')
+  for (const button of openButtons) {
+    assert.equal(button.type, 'button')
+    assert.equal(typeof button.props.onClick, 'function')
+    assert.ok(String(button.props['aria-label']).startsWith('打开会话明细：'))
+    assert.ok(button.props.title.length > 0)
+  }
+  assert.deepEqual(openButtons.map(button => button.props['data-session-id']), ['parent-session', 'root-session', 'child-session'])
+  openButtons[1].props.onClick()
+  assert.deepEqual(opened, ['root-session'])
+  const innerTitles = nodes.filter(node => node.props?.['data-dsh-part'] === 'session-title')
+  assert.equal(innerTitles.length, 3, 'the existing session-title marker stays on the inner label')
+  assert.equal(innerTitles[1].props.children, '根会话标题')
+
+  const chevron = nodes.find(node => node.props?.['data-dsh-part'] === 'session-toggle')
+  assert.ok(chevron, 'the expand chevron is still rendered')
+  chevron.props.onClick()
+  assert.deepEqual(toggled, ['parent-session'], 'the chevron toggles the tree row')
+  assert.deepEqual(opened, ['root-session'], 'the chevron never opens the drill-down')
+
+  const readOnly = components.SessionTreeTable({ bySession: m3BySession(), currency: 'CNY', t })
+  assert.equal(
+    flattenM26(readOnly).some(node => node.props?.['data-dsh-part'] === 'session-open'),
+    false,
+    'without onOpen the table keeps the pre-M3 read-only titles',
+  )
+})
+
+test('M3 SessionDetailView renders the full mini dashboard', () => {
+  const plugin = captured.factory(fakeRequire)
+  const { components, normalizeSessionDetail, createDrillState, sessionBreadcrumb } = plugin.__test
+  const t = makeT26('zh')
+  const { rpc } = m3RpcSpy()
+  const state = {
+    ...createDrillState('2026-11-01|2026-11-07'),
+    sessionId: 'root-session',
+    includeDescendants: true,
+    status: 'ready',
+    data: normalizeSessionDetail(m3DetailRaw()),
+    lastSessionId: 'root-session',
+  }
+  let backs = 0
+  const navigations = []
+  const toggles = []
+  const view = components.SessionDetailView({
+    state,
+    t,
+    rpc,
+    range: { from: '2026-11-01', to: '2026-11-07' },
+    sessionTitles: m3Titles,
+    breadcrumb: sessionBreadcrumb(m3BySession(), 'root-session'),
+    onBack: () => { backs += 1 },
+    onNavigate: sessionId => navigations.push(sessionId),
+    onToggleDescendants: value => toggles.push(value),
+  })
+  const text = textOfM26(view)
+  for (const expected of [
+    '根会话标题',
+    '父会话标题',
+    '当前为子树汇总',
+    '含子代理',
+    '本会话摘要',
+    '总 tokens（含缓存）',
+    '按调用目的',
+    '主对话',
+    'deepseek-flash',
+    '按内容来源',
+    '工具分组',
+    '记忆',
+    '搜索 / 抓取',
+    '3 次',
+    '按天趋势',
+    '直接子会话',
+    '子会话标题',
+    '本会话请求明细',
+  ]) {
+    assert.ok(text.includes(expected), `detail view renders ${expected}: ${text.slice(0, 600)}`)
+  }
+  assert.ok(!text.includes('未归因（升级前仅总量）'), 'the range-level unattributed row is not shown')
+  for (const part of [
+    'session-detail-header',
+    'session-detail-summary',
+    'session-detail-purpose',
+    'session-detail-models',
+    'session-detail-tools',
+    'session-detail-web',
+    'session-detail-trend',
+    'session-detail-children',
+    'session-requests',
+  ]) {
+    assert.ok(flattenM26(view).some(node => node.props?.['data-dsh-part'] === part), `${part} is present`)
+  }
+
+  flattenM26(view).find(node => node.props?.['data-dsh-part'] === 'session-detail-back').props.onClick()
+  assert.equal(backs, 1)
+  const childButton = flattenM26(view).find(node => node.props?.['data-dsh-part'] === 'session-detail-child')
+  assert.equal(childButton.props['data-session-id'], 'child-session')
+  const childTable = flattenM26(view).find(node => node.props?.['data-dsh-part'] === 'session-detail-children')
+  const childRow = flattenM26(childTable).find(node => node.type === 'tr' && textOfM26(node).includes('子会话标题'))
+  assert.ok(childRow, 'the direct child row renders')
+  assert.deepEqual(
+    childRow.props.children.map(cell => textOfM26(cell)),
+    ['子会话标题', '2', '150', '50', '¥0.050'],
+    'child cells show the child subtree totals (including the grandchild)',
+  )
+  childButton.props.onClick()
+  assert.deepEqual(navigations, ['child-session'])
+  const crumb = flattenM26(view).find(node => node.props?.['data-dsh-part'] === 'session-crumb')
+  assert.equal(crumb.props['data-session-id'], 'parent-session')
+  crumb.props.onClick()
+  assert.deepEqual(navigations, ['child-session', 'parent-session'], 'clicking a crumb navigates to the ancestor')
+
+  const toggle = flattenM26(view).find(node => node.props?.role === 'switch')
+  assert.equal(toggle.props['aria-checked'], true)
+  toggle.props.onClick()
+  assert.deepEqual(toggles, [false], 'the toggle requests single-session mode')
+})
+
+test('M3 detail falls back when attribution detail is unavailable or the session vanished', () => {
+  const plugin = captured.factory(fakeRequire)
+  const { components, normalizeSessionDetail, createDrillState, normalizeSummary } = plugin.__test
+  const t = makeT26('zh')
+  const fallbackRaw = {
+    sessionId: 'root-session',
+    includeDescendants: true,
+    detailAvailable: false,
+    detailReason: 'detail-expired',
+    range: { from: '2026-11-01', to: '2026-11-07' },
+    session: m3BySession()[1],
+    summary: {
+      totals: { promptTokens: 200, outputTokens: 80, totalTokens: 280, requests: 2 },
+      byPurpose: { chat: { requests: 2, promptTokens: 200, outputTokens: 80 } },
+      byCategory: { user: 200 },
+      byModel: [{ provider: 'deepseek-official', model: 'deepseek-flash', requests: 2, promptTokens: 200, outputTokens: 80, tokens: 280 }],
+      byDay: [{ day: '2026-11-05', promptTokens: 200, outputTokens: 80, requests: 2 }],
+      cost: { amount: 0.2, currency: 'CNY', priced: true },
+    },
+  }
+  const fallbackState = {
+    ...createDrillState('2026-11-01|2026-11-07'),
+    sessionId: 'root-session',
+    status: 'ready',
+    data: normalizeSessionDetail(fallbackRaw),
+  }
+  const fallback = textOfM26(components.SessionDetailView({
+    state: fallbackState,
+    t,
+    range: { from: '2026-11-01', to: '2026-11-07' },
+    sessionTitles: m3Titles,
+    onBack() {},
+    onNavigate() {},
+    onToggleDescendants() {},
+  }))
+  assert.ok(fallback.includes('明细仅保留 30 天，无法展开归因'), 'the localized fallback note is shown')
+  assert.ok(fallback.includes('根会话标题'), 'the session header still renders')
+  assert.ok(fallback.includes('总 tokens（含缓存）'), 'summary cards still render')
+  for (const hidden of ['按调用目的', '按内容来源', '工具分组', '按天趋势', '直接子会话', '本会话请求明细']) {
+    assert.ok(!fallback.includes(hidden), `the unavailable fallback hides ${hidden}`)
+  }
+
+  const missingRaw = normalizeSessionDetail({
+    sessionId: 'gone-session',
+    range: { from: '2026-11-01', to: '2026-11-07' },
+    summary: { totals: {} },
+  })
+  const missingState = {
+    ...createDrillState(),
+    sessionId: 'gone-session',
+    status: 'empty',
+    data: missingRaw,
+  }
+  const missing = textOfM26(components.SessionDetailView({
+    state: missingState,
+    t,
+    sessionTitles: null,
+    onBack() {},
+    onNavigate() {},
+    onToggleDescendants() {},
+  }))
+  assert.ok(missing.includes('该会话已不在所选范围内'))
+  assert.ok(missing.includes('返回会话列表'), 'the empty state offers Back')
+  assert.ok(!missing.includes('本会话摘要'), 'no cards render for a vanished session')
+
+  const summary = normalizeSummary(m3SummaryRaw())
+  const warning = textOfM26(components.SessionsTab({
+    summary,
+    t,
+    sessionTitles: null,
+    drillError: { code: 'internal', message: 'boom', details: {} },
+    onRetryDrill() {},
+  }))
+  assert.ok(warning.includes('刷新失败'), 'the drill failure warning renders above the tree')
+  assert.ok(warning.includes('Host 在处理请求时失败'))
+})
+
+test('M3 request table fetches the combined sessionIds set and paginates 20 rows', () => {
+  const plugin = captured.factory(fakeRequire)
+  const { components, detailsReducer, createDetailsState, normalizeSessionDetail, createDrillState } = plugin.__test
+  const t = makeT26('zh')
+
+  const calls = []
+  const rpc = {
+    async call(endpoint, payload) {
+      calls.push({ endpoint, payload })
+      return { ok: true, value: { items: [], total: 0 } }
+    },
+    getChannel() {
+      return '/token-attribution'
+    },
+    setChannel() {},
+  }
+  const effectReact = { ...fakeReact, useEffect(effect) { effect() } }
+  const effectPlugin = captured.factory(name => {
+    if (name === 'react') return effectReact
+    throw new Error(`unexpected require: ${name}`)
+  })
+  effectPlugin.__test.components.SessionRequestTable({
+    t,
+    rpc,
+    range: { from: '2026-11-01', to: '2026-11-07' },
+    sessionId: 'root-session',
+    includeDescendants: true,
+    sessionIds: ['root-session', 'child-session'],
+    sessionTitles: m3Titles,
+    limit: 20,
+  })
+  assert.deepEqual(calls, [{
+    endpoint: 'requests',
+    payload: {
+      from: '2026-11-01',
+      to: '2026-11-07',
+      limit: 20,
+      offset: 0,
+      sessionIds: ['root-session', 'child-session'],
+    },
+  }], 'subtree mode sends the combined sessionIds list')
+
+  const singleCalls = []
+  const singleRpc = {
+    async call(endpoint, payload) {
+      singleCalls.push({ endpoint, payload })
+      return { ok: true, value: { items: [], total: 0 } }
+    },
+    getChannel() {
+      return '/token-attribution'
+    },
+    setChannel() {},
+  }
+  effectPlugin.__test.components.SessionRequestTable({
+    t,
+    rpc: singleRpc,
+    range: { from: '2026-11-01', to: '2026-11-07' },
+    sessionId: 'root-session',
+    includeDescendants: false,
+    sessionIds: ['root-session', 'child-session'],
+  })
+  assert.deepEqual(singleCalls[0].payload, {
+    from: '2026-11-01',
+    to: '2026-11-07',
+    limit: 20,
+    offset: 0,
+    sessionId: 'root-session',
+  }, 'single-session mode sends only sessionId')
+
+  const pageItems = Array.from({ length: 20 }, (_, index) => ({
+    key: `r-${index}`,
+    ts: 1700000000000 + index,
+    sessionId: index === 0 ? 'root-session' : 'child-session',
+    purpose: 'chat',
+    promptTokens: 10,
+    outputTokens: 2,
+    cacheReadTokens: 1,
+    cost: { amount: 0.001, currency: 'CNY', priced: true },
+  }))
+  let more = 0
+  const ready = components.SessionRequestsSection({
+    t,
+    state: { status: 'ready', items: pageItems, total: 40, offset: 0, error: null },
+    sessionTitles: m3Titles,
+    limit: 20,
+    onLoadMore: () => { more += 1 },
+    onRetry() {},
+  })
+  const readyText = textOfM26(ready)
+  assert.ok(readyText.includes('本会话请求明细'))
+  assert.ok(readyText.includes('已显示 20 / 40 条'))
+  assert.ok(readyText.includes('根会话标题'))
+  flattenM26(ready).find(node => node.props?.['data-dsh-part'] === 'session-requests-load-more').props.onClick()
+  assert.equal(more, 1)
+
+  const done = textOfM26(components.SessionRequestsSection({
+    t,
+    state: { status: 'ready', items: pageItems.concat(pageItems), total: 40, offset: 20, error: null },
+    sessionTitles: null,
+    onLoadMore() {},
+    onRetry() {},
+  }))
+  assert.ok(done.includes('已加载全部 40 条'))
+
+  let retries = 0
+  const failed = components.SessionRequestsSection({
+    t,
+    state: {
+      status: 'error',
+      items: pageItems.slice(0, 2),
+      total: 40,
+      offset: 0,
+      error: { code: 'bad-request', message: '', details: {} },
+    },
+    sessionTitles: null,
+    onLoadMore() {},
+    onRetry: () => { retries += 1 },
+  })
+  const failedText = textOfM26(failed)
+  assert.ok(failedText.includes('Host 拒绝了请求参数'))
+  assert.ok(failedText.includes('本会话请求明细加载失败'))
+  assert.ok(failedText.includes('root-session'), 'already-loaded rows stay visible after a failure')
+  flattenM26(failed).find(node => node.props?.['data-dsh-part'] === 'session-requests-retry').props.onClick()
+  assert.equal(retries, 1)
+
+  const emptyText = textOfM26(components.SessionRequestsSection({
+    t,
+    state: { ...createDetailsState('x'), status: 'ready' },
+    sessionTitles: null,
+    onLoadMore() {},
+    onRetry() {},
+  }))
+  assert.ok(emptyText.includes('所选会话集合暂无请求明细'))
+  const loadingText = textOfM26(components.SessionRequestsSection({
+    t,
+    state: { ...createDetailsState('x'), status: 'loading' },
+    sessionTitles: null,
+    onLoadMore() {},
+    onRetry() {},
+  }))
+  assert.ok(loadingText.includes('正在加载请求明细'))
+
+  let state = createDetailsState('scope')
+  state = detailsReducer(state, { type: 'loaded', items: pageItems, total: 40 })
+  assert.equal(state.status, 'ready')
+  state = detailsReducer(state, { type: 'more' })
+  assert.equal(state.offset, 20)
+  state = detailsReducer(state, { type: 'loaded', items: pageItems, total: 40 })
+  assert.equal(state.items.length, 40)
+  assert.equal(state.items[20].key, 'r-0')
+
+  const detail = normalizeSessionDetail(m3DetailRaw())
+  assert.deepEqual(detail.sessionIds, ['root-session', 'child-session'])
+  assert.equal(detail.includeDescendants, true)
+  assert.equal(createDrillState().status, 'idle')
+})
+
+test('M3 UsagePanel opens titles, toggles descendants and refetches on range change', async () => {
+  const plugin = captured.factory(fakeRequire)
+  const { components } = plugin.__test
+  const localeRuntime = {
+    bind: () => key => key,
+    getSnapshot: () => ({ active: 'zh' }),
+    subscribe: () => () => {},
+  }
+  const initialSummary = m3SummaryRaw()
+
+  // 1) Opening a session title calls sessionDetail with subtree mode.
+  const openSpy = m3RpcSpy()
+  const openPanel = components.UsagePanel({
+    localeRuntime,
+    rpc: openSpy.rpc,
+    initialTab: 'sessions',
+    initialSummary,
+  })
+  const openButton = flattenM26(openPanel).find(node => node.props?.['data-dsh-part'] === 'session-open' && node.props['data-session-id'] === 'parent-session')
+  assert.ok(openButton, 'the sessions tree renders clickable titles')
+  openButton.props.onClick()
+  await Promise.resolve()
+  const sessionDetailCalls = openSpy.calls.filter(call => call.endpoint === 'sessionDetail')
+  assert.deepEqual(sessionDetailCalls[0].payload, {
+    range: 'today',
+    sessionId: 'parent-session',
+    includeDescendants: true,
+  }, 'opening defaults to includeDescendants: true')
+
+  // 2) In the detail view the toggle refetches with includeDescendants false/true.
+  const toggleOff = m3RpcSpy()
+  const detailPanel = components.UsagePanel({
+    localeRuntime,
+    rpc: toggleOff.rpc,
+    initialTab: 'sessions',
+    initialSummary,
+    useSessions: selector => selector({ byId: m3Titles }),
+    initialDrill: { sessionId: 'root-session', includeDescendants: true, data: m3DetailRaw() },
+  })
+  const detailText = textOfM26(detailPanel)
+  assert.ok(detailText.includes('根会话标题'), 'the detail view replaces the tree in the Sessions tab')
+  assert.ok(!detailText.includes('默认仅显示根会话'), 'the tree is not rendered while detailed')
+  const toggle = flattenM26(detailPanel).find(node => node.props?.role === 'switch')
+  assert.ok(toggle)
+  toggle.props.onClick()
+  await Promise.resolve()
+  assert.deepEqual(toggleOff.calls.filter(call => call.endpoint === 'sessionDetail')[0].payload, {
+    range: 'today',
+    sessionId: 'root-session',
+    includeDescendants: false,
+  }, 'turning the toggle off refetches single-session mode')
+
+  const toggleOn = m3RpcSpy()
+  const singlePanel = components.UsagePanel({
+    localeRuntime,
+    rpc: toggleOn.rpc,
+    initialTab: 'sessions',
+    initialSummary,
+    initialDrill: { sessionId: 'root-session', includeDescendants: false, data: m3DetailRaw() },
+  })
+  flattenM26(singlePanel).find(node => node.props?.role === 'switch').props.onClick()
+  await Promise.resolve()
+  assert.deepEqual(toggleOn.calls.filter(call => call.endpoint === 'sessionDetail')[0].payload, {
+    range: 'today',
+    sessionId: 'root-session',
+    includeDescendants: true,
+  }, 'turning the toggle on refetches subtree mode')
+
+  // 3) Child and breadcrumb clicks drill to the target session.
+  const navSpy = m3RpcSpy()
+  const navPanel = components.UsagePanel({
+    localeRuntime,
+    rpc: navSpy.rpc,
+    initialTab: 'sessions',
+    initialSummary,
+    initialDrill: { sessionId: 'root-session', includeDescendants: true, data: m3DetailRaw() },
+  })
+  flattenM26(navPanel).find(node => node.props?.['data-dsh-part'] === 'session-detail-child').props.onClick()
+  await Promise.resolve()
+  assert.equal(
+    navSpy.calls.filter(call => call.endpoint === 'sessionDetail')[0].payload.sessionId,
+    'child-session',
+    'a child row drills into that child',
+  )
+  const crumb = flattenM26(navPanel).find(node => node.props?.['data-dsh-part'] === 'session-crumb')
+  assert.equal(crumb.props['data-session-id'], 'parent-session')
+  crumb.props.onClick()
+  await Promise.resolve()
+  assert.equal(
+    navSpy.calls.filter(call => call.endpoint === 'sessionDetail')[1].payload.sessionId,
+    'parent-session',
+    'a breadcrumb click navigates to the ancestor',
+  )
+
+  // 4) Back stays local and clears the reducer selection.
+  const backSpy = m3RpcSpy()
+  const backPanel = components.UsagePanel({
+    localeRuntime,
+    rpc: backSpy.rpc,
+    initialTab: 'sessions',
+    initialSummary,
+    initialDrill: { sessionId: 'root-session', includeDescendants: true, data: m3DetailRaw() },
+  })
+  const beforeBack = backSpy.calls.length
+  flattenM26(backPanel).find(node => node.props?.['data-dsh-part'] === 'session-detail-back').props.onClick()
+  assert.equal(backSpy.calls.length, beforeBack, 'Back does not refetch; it just clears the selection state')
+
+  // 5) A range change refetches the open detail with the new named range.
+  const rangeSpy = m3RpcSpy()
+  const rangePanel = components.UsagePanel({
+    localeRuntime,
+    rpc: rangeSpy.rpc,
+    initialTab: 'sessions',
+    initialSummary,
+    initialDrill: { sessionId: 'root-session', includeDescendants: true, data: m3DetailRaw() },
+  })
+  const rangeButton = flattenM26(rangePanel).find(node => node.type === 'button' && textOfM26(node) === '近 7 天')
+  assert.ok(rangeButton, 'the range control stays in the shared header')
+  rangeButton.props.onClick()
+  await Promise.resolve()
+  const refetch = rangeSpy.calls.filter(call => call.endpoint === 'sessionDetail')
+  assert.equal(refetch.length, 1)
+  assert.deepEqual(refetch[0].payload, {
+    range: '7d',
+    sessionId: 'root-session',
+    includeDescendants: true,
+  }, 'a range change refetches the drill-down for the new range')
+
+  // 6) A failed drill fetch clears the selection (the reducer drops sessionId)
+  // so the next render is the tree again.
+  const errorRpc = {
+    async call(endpoint) {
+      if (endpoint === 'sessionDetail') {
+        return { ok: false, error: { code: 'internal', message: 'boom', details: {} } }
+      }
+      return { ok: true, value: {} }
+    },
+    getChannel() {
+      return '/token-attribution'
+    },
+    setChannel() {},
+  }
+  const errorPanel = components.UsagePanel({ localeRuntime, rpc: errorRpc, initialTab: 'sessions', initialSummary })
+  flattenM26(errorPanel).find(node => node.props?.['data-dsh-part'] === 'session-open').props.onClick()
+  await Promise.resolve()
+  assert.ok(textOfM26(errorPanel).includes('默认仅显示根会话'), 'the tree is shown while no drill is open')
+})
+
+test('M3 locale keys have zh/en parity and the localized fallback note', () => {
+  const { locales } = captured.factory(fakeRequire).__test
+  const keys = [
+    'table.sessions.open',
+    'sessionDetail.back',
+    'sessionDetail.breadcrumb',
+    'sessionDetail.includeDescendants',
+    'sessionDetail.onlySession',
+    'sessionDetail.toggleHint',
+    'sessionDetail.toggleSingleHint',
+    'sessionDetail.subtreeNote',
+    'sessionDetail.singleNote',
+    'sessionDetail.loading',
+    'sessionDetail.loadFailed',
+    'sessionDetail.unavailable',
+    'sessionDetail.partial',
+    'sessionDetail.missing',
+    'sessionDetail.missingHint',
+    'sessionDetail.summaryTitle',
+    'sessionDetail.cardsHint',
+    'sessionDetail.childrenTitle',
+    'sessionDetail.childrenHint',
+    'sessionDetail.childrenHintSingle',
+    'sessionDetail.childrenEmpty',
+    'sessionDetail.child',
+    'sessionDetail.crumb',
+    'sessionDetail.requestsTitle',
+    'sessionDetail.requestsHint',
+    'sessionDetail.requestsEmpty',
+    'sessionDetail.requestsFailed',
+    'sessionDetail.webHint',
+  ]
+  for (const key of keys) {
+    assert.ok(Object.hasOwn(locales.en, key), `en.${key} exists`)
+    assert.ok(Object.hasOwn(locales.zh, key), `zh.${key} exists`)
+    assert.equal(typeof locales.en[key], 'string')
+    assert.equal(typeof locales.zh[key], 'string')
+    assert.ok(locales.en[key].length > 0)
+    assert.ok(locales.zh[key].length > 0)
+  }
+  assert.equal(locales.zh['sessionDetail.unavailable'], '明细仅保留 30 天，无法展开归因')
+  assert.ok(locales.en['sessionDetail.unavailable'].includes('30 days'))
+  assert.equal(locales.zh['sessionDetail.includeDescendants'], '含子代理')
+  assert.equal(locales.zh['sessionDetail.onlySession'], '仅本会话')
+  assert.equal(locales.zh['sessionDetail.back'], '返回会话列表')
+  assert.equal(locales.en['table.sessions.open'], 'Open session detail: {name}')
+  assert.equal(locales.zh['table.sessions.open'], '打开会话明细：{name}')
+})
+
+test('M3 vanished parent keeps surviving child sessions navigable', () => {
+  const plugin = captured.factory(fakeRequire)
+  const { components, normalizeSessionDetail, createDrillState } = plugin.__test
+  const t = makeT26('zh')
+  const data = normalizeSessionDetail({
+    sessionId: 'gone-session',
+    detailReason: 'session-not-found',
+    detailAvailable: false,
+    session: null,
+    children: [m3BySession()[2]],
+    sessionIds: ['gone-session', 'child-session'],
+    summary: { totals: {} },
+    webApi: { bySession: [] },
+  })
+  const state = {
+    ...createDrillState('2026-11-01|2026-11-07'),
+    sessionId: 'gone-session',
+    includeDescendants: true,
+    status: 'empty',
+    data,
+    lastSessionId: 'gone-session',
+  }
+  const opened = []
+  const view = components.SessionDetailView({
+    state,
+    t,
+    rpc: m3RpcSpy().rpc,
+    range: { from: '2026-11-01', to: '2026-11-07' },
+    sessionTitles: m3Titles,
+    breadcrumb: [],
+    onBack: () => {},
+    onNavigate: sessionId => opened.push(sessionId),
+    onToggleDescendants: () => {},
+  })
+  const nodes = flattenM26(view)
+  assert.ok(nodes.some(node => node.props?.['data-dsh-part'] === 'session-detail-missing'), 'the missing state renders')
+  const child = nodes.find(node => node.props?.['data-dsh-part'] === 'session-detail-missing-child')
+  assert.equal(child.props['data-session-id'], 'child-session')
+  child.props.onClick()
+  assert.deepEqual(opened, ['child-session'])
+})
