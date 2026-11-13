@@ -59,6 +59,7 @@ window.__ModuleLoader__.load({
     const DETAILS_PAGE_SIZE = 20
     const SESSION_FILTER_LIMIT = 100
     const DETAILS_FILTER_ALL = 'all'
+    const UNPRICED_REASON_KEYS = Object.freeze(['aborted', 'transport', 'no-usage', 'no-price', 'other', 'unknown'])
     const DETAILS_PURPOSES = Object.freeze(['chat', 'auto-review', 'compaction', 'session-title'])
 
     const CONFIG_FIELD_ORDER = Object.freeze([
@@ -1195,6 +1196,38 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Normalize the Host's unpriced-reason counter map.
+     * @param {unknown} raw - `{reason: count}` map.
+     * @returns {Record<string, number>} normalized counts.
+     */
+    function normalizeUnpricedReasons(raw) {
+      const result = {}
+      if (!isPlainObject(raw)) return result
+      for (const reason of UNPRICED_REASON_KEYS) {
+        const count = countNumber(raw[reason])
+        if (count > 0) result[reason] = count
+      }
+      return result
+    }
+
+    /**
+     * Render the unpriced reason breakdown, e.g. `中断 9 · 传输失败 4`.
+     * @param {(key: string, params?: object) => string} t - translator.
+     * @param {unknown} raw - unpriced reason counts.
+     * @returns {string} joined reason text, or '' when no counts.
+     */
+    function unpricedReasonsText(t, raw) {
+      const reasons = normalizeUnpricedReasons(raw)
+      return UNPRICED_REASON_KEYS
+        .filter(reason => (reasons[reason] ?? 0) > 0)
+        .map(reason => t('unpriced.reasonItem', {
+          label: t(`unpriced.${reason}`),
+          count: formatTokens(reasons[reason]),
+        }))
+        .join(' · ')
+    }
+
+    /**
      * Normalize `totals.costByCurrency` into a currency-keyed map.
      * @param {unknown} raw - map or array of cost values.
      * @returns {Record<string, object>} normalized map.
@@ -1776,6 +1809,24 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Classify an unpriced request for display.
+     *
+     * Mirrors the Host's reason keys: aborted/transport/no-usage/no-price.
+     * A priced row returns an empty key.
+     * @param {object} entry - raw or normalized request row.
+     * @returns {string} reason key or ''.
+     */
+    function requestUnpricedReason(entry) {
+      if (entry?.cost?.priced === true) return ''
+      const code = String(entry?.error?.code ?? entry?.error ?? '').toUpperCase()
+      if (code === 'ABORTED') return 'aborted'
+      if (code === 'TRANSPORT' || code === 'TIMEOUT' || code === 'NETWORK'
+        || code === 'ECONNRESET' || code === 'ETIMEDOUT') return 'transport'
+      if (entry?.usage == null || entry?.usageEstimated === true) return 'no-usage'
+      return 'no-price'
+    }
+
+    /**
      * Normalize the Host's `requests` page.
      *
      * Detail rows carry numbers and category names only; the ledger never
@@ -1804,6 +1855,7 @@ window.__ModuleLoader__.load({
           outputTokens: tokenNumber(entry.outputTokens ?? entry.output),
           cacheReadTokens: tokenNumber(entry.cacheReadTokens ?? entry.cacheRead ?? entry.usage?.cacheRead),
           cost: normalizeCost(entry.cost, entry.currency),
+          unpricedReason: requestUnpricedReason(entry),
         })
       }
       items.sort((left, right) => right.ts - left.ts)
@@ -1834,6 +1886,7 @@ window.__ModuleLoader__.load({
       if (purpose !== '' && purpose !== DETAILS_FILTER_ALL) payload.purpose = purpose
       const sessionId = typeof opts.sessionId === 'string' ? opts.sessionId.trim() : ''
       if (sessionId !== '' && sessionId !== DETAILS_FILTER_ALL) payload.sessionId = sessionId
+      if (opts.unpricedOnly === true) payload.unpricedOnly = true
       return payload
     }
 
@@ -1914,6 +1967,7 @@ window.__ModuleLoader__.load({
         offset: 0,
         purpose: DETAILS_FILTER_ALL,
         sessionId: DETAILS_FILTER_ALL,
+        unpricedOnly: false,
         rangeKey: typeof rangeKey === 'string' ? rangeKey : '',
       }
     }
@@ -1940,6 +1994,7 @@ window.__ModuleLoader__.load({
           ...current,
           purpose: typeof action.purpose === 'string' ? action.purpose : current.purpose,
           sessionId: typeof action.sessionId === 'string' ? action.sessionId : current.sessionId,
+          unpricedOnly: typeof action.unpricedOnly === 'boolean' ? action.unpricedOnly : current.unpricedOnly === true,
           status: 'loading',
           items: [],
           total: 0,
@@ -2240,6 +2295,7 @@ window.__ModuleLoader__.load({
           currency: costCurrency,
           byCurrency: normalizeCostMap(rawTotals.costByCurrency ?? value.costByCurrency),
         },
+        unpricedReasons: normalizeUnpricedReasons(value.unpricedReasons),
         data: {
           since: typeof rawData.since === 'string' ? rawData.since : null,
           retention: rawRetention === null ? null : {
@@ -3530,6 +3586,7 @@ window.__ModuleLoader__.load({
         'card.cost': 'Estimated cost',
         'card.costHint': 'Based on the configured prices',
         'card.costUnpriced': 'Unpriced requests: {count}',
+        'card.costUnpricedReasons': 'Unpriced requests: {count} ({reasons})',
         'card.costPriced': 'Price table applied',
         'card.webApi': 'Search & fetch',
         'card.webApiValue': '{calls} {unit}',
@@ -3665,6 +3722,13 @@ window.__ModuleLoader__.load({
         'table.share': 'Share',
         'table.cost': 'Cost',
         'table.costMixed': 'Mixed',
+        'unpriced.aborted': 'Aborted',
+        'unpriced.transport': 'Transport failed',
+        'unpriced.no-usage': 'No usage',
+        'unpriced.no-price': 'No price',
+        'unpriced.other': 'Other',
+        'unpriced.unknown': 'Unknown',
+        'unpriced.reasonItem': '{label} {count}',
         'table.toolGroups.title': 'Tool groups',
         'table.toolGroups.hint': 'Prompt tokens by tool group (tool declarations and tool results)',
         'table.toolGroups.group': 'Tool group',
@@ -3692,6 +3756,8 @@ window.__ModuleLoader__.load({
         'details.hint': 'Every request in the selected range, {limit} rows per page',
         'details.purposeFilter': 'Purpose',
         'details.sessionFilter': 'Session',
+        'details.unpricedOnly': 'Unpriced only',
+        'details.unpricedReason': 'Unpriced reason',
         'details.filterAll': 'All',
         'details.session': 'Session',
         'details.loadMore': 'Load more',
@@ -3991,6 +4057,7 @@ window.__ModuleLoader__.load({
         'card.cost': '预估费用',
         'card.costHint': '按配置单价估算',
         'card.costUnpriced': '未定价请求：{count}',
+        'card.costUnpricedReasons': '未定价请求：{count}（{reasons}）',
         'card.costPriced': '已应用价目表',
         'card.webApi': '搜索 / 抓取',
         'card.webApiValue': '{calls} {unit}',
@@ -4126,6 +4193,13 @@ window.__ModuleLoader__.load({
         'table.share': '占比',
         'table.cost': '费用',
         'table.costMixed': '混币',
+        'unpriced.aborted': '中断',
+        'unpriced.transport': '传输失败',
+        'unpriced.no-usage': '无 usage',
+        'unpriced.no-price': '未配置价格',
+        'unpriced.other': '其他',
+        'unpriced.unknown': '未知',
+        'unpriced.reasonItem': '{label} {count}',
         'table.toolGroups.title': '工具分组',
         'table.toolGroups.hint': '按工具分组汇总的 prompt tokens（含工具声明与工具结果）',
         'table.toolGroups.group': '工具分组',
@@ -4153,6 +4227,8 @@ window.__ModuleLoader__.load({
         'details.hint': '所选范围内的逐条请求，每页 {limit} 条',
         'details.purposeFilter': '调用目的',
         'details.sessionFilter': '会话',
+        'details.unpricedOnly': '只看未定价',
+        'details.unpricedReason': '未定价原因',
         'details.filterAll': '全部',
         'details.session': '会话',
         'details.loadMore': '加载更多',
@@ -5494,6 +5570,7 @@ window.__ModuleLoader__.load({
           h('th', { key: 'output', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.output')),
           h('th', { key: 'cacheRead', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.cacheRead')),
           h('th', { key: 'cost', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.cost')),
+          h('th', { key: 'unpricedReason', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('details.unpricedReason')),
         ])),
         h('tbody', { key: 'tbody' }, items.map(row => h('tr', { key: row.key }, [
           h('td', { key: 'time', style: { ...cellStyle, textAlign: 'left', fontVariantNumeric: 'tabular-nums' } }, formatTime(row.ts)),
@@ -5503,6 +5580,10 @@ window.__ModuleLoader__.load({
           h('td', { key: 'output', style: rightCell }, tokenCell(row.outputTokens)),
           h('td', { key: 'cacheRead', style: rightCell }, tokenCell(row.cacheReadTokens)),
           h('td', { key: 'cost', style: rightCell }, formatCostCell(row.cost, undefined, { mixed: t('table.costMixed') })),
+          h('td', {
+            key: 'unpricedReason',
+            style: { ...cellStyle, textAlign: 'left', color: row.unpricedReason ? COLORS.warning : COLORS.muted },
+          }, row.unpricedReason ? t(`unpriced.${row.unpricedReason}`) : ''),
         ]))),
       ]))
     }
@@ -5524,6 +5605,7 @@ window.__ModuleLoader__.load({
       const limit = Number.isInteger(props.limit) && props.limit > 0 ? props.limit : DETAILS_PAGE_SIZE
       const purpose = typeof state.purpose === 'string' ? state.purpose : DETAILS_FILTER_ALL
       const sessionId = typeof state.sessionId === 'string' ? state.sessionId : DETAILS_FILTER_ALL
+      const unpricedOnly = state.unpricedOnly === true
       const items = Array.isArray(state.items) ? state.items : []
       const total = countNumber(state.total)
       const options = sessionFilterOptions(props.sessions, sessionTitles)
@@ -5567,6 +5649,21 @@ window.__ModuleLoader__.load({
             style: selectStyle,
           }, [h('option', { key: DETAILS_FILTER_ALL, value: DETAILS_FILTER_ALL }, t('details.filterAll')),
             ...options.map(option => h('option', { key: option.value, value: option.value }, option.label))]),
+        ]),
+        h('label', {
+          key: 'unpriced',
+          style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: COLORS.muted, paddingBottom: 4 },
+        }, [
+          h('input', {
+            type: 'checkbox',
+            checked: unpricedOnly,
+            'data-dsh-part': 'details-unpriced',
+            onChange: event => {
+              if (typeof props.onUnpricedChange === 'function') props.onUnpricedChange(event.target.checked)
+            },
+            style: { margin: 0 },
+          }),
+          t('details.unpricedOnly'),
         ]),
         h('p', {
           key: 'progress',
@@ -6764,6 +6861,7 @@ window.__ModuleLoader__.load({
     function summaryCardModels(t, summary) {
       const totals = summary.totals
       const unpriced = summary.cost.unpricedRequests
+      const unpricedReasonText = unpriced > 0 ? unpricedReasonsText(t, summary.unpricedReasons) : ''
       const costMixed = summary.cost.currency === 'mixed'
       return [
         {
@@ -6813,7 +6911,9 @@ window.__ModuleLoader__.load({
             ? t('table.costMixed')
             : formatCurrency(summary.cost.amount, summary.cost.currency),
           hint: unpriced > 0
-            ? t('card.costUnpriced', { count: formatTokens(unpriced) })
+            ? unpricedReasonText !== ''
+              ? t('card.costUnpricedReasons', { count: formatTokens(unpriced), reasons: unpricedReasonText })
+              : t('card.costUnpriced', { count: formatTokens(unpriced) })
             : t('card.costHint'),
           tone: unpriced > 0 ? 'warning' : 'default',
         },
@@ -8678,6 +8778,7 @@ window.__ModuleLoader__.load({
               offset,
               purpose: details.purpose,
               sessionId: details.sessionId,
+              unpricedOnly: details.unpricedOnly,
             }))
           } catch (caught) {
             result = { ok: false, error: { code: 'transport', message: errorMessage(caught), details: {} } }
@@ -8694,7 +8795,7 @@ window.__ModuleLoader__.load({
         return () => {
           cancelled = true
         }
-      }, [activeTab, detailsRangeKey, details.rangeKey, details.purpose, details.sessionId, details.offset, detailsNonce, rpc])
+      }, [activeTab, detailsRangeKey, details.rangeKey, details.purpose, details.sessionId, details.unpricedOnly, details.offset, detailsNonce, rpc])
 
       const switchTab = React.useCallback(next => {
         if (!isValidTab(next) || next === activeTab) return
@@ -8928,6 +9029,7 @@ window.__ModuleLoader__.load({
             limit: DETAILS_PAGE_SIZE,
             onPurposeChange: value => setDetails(current => detailsReducer(current, { type: 'filters', purpose: value })),
             onSessionChange: value => setDetails(current => detailsReducer(current, { type: 'filters', sessionId: value })),
+          onUnpricedChange: value => setDetails(current => detailsReducer(current, { type: 'filters', unpricedOnly: value === true })),
             onLoadMore: () => setDetails(current => detailsReducer(current, { type: 'more' })),
             onRetry: () => setDetailsNonce(nonce => nonce + 1),
           })

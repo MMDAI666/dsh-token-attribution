@@ -350,6 +350,9 @@ export function createRpcHandler({ store, configModule, configState, ctx, diag }
               badRequest(`sessionIds must be an array of 1..${MAX_REQUEST_SESSION_IDS} non-empty strings`, { field: 'sessionIds' })
             }
           }
+          if (body.unpricedOnly !== undefined && typeof body.unpricedOnly !== 'boolean') {
+            badRequest('unpricedOnly must be a boolean', { field: 'unpricedOnly' })
+          }
           return success(store.readRequests({
             date: body.date,
             from: body.from,
@@ -359,6 +362,7 @@ export function createRpcHandler({ store, configModule, configState, ctx, diag }
             purpose: body.purpose,
             sessionId: body.sessionId,
             sessionIds: body.sessionIds,
+            unpricedOnly: body.unpricedOnly === true,
           }))
         }
         case 'sessionDetail': {

@@ -33,6 +33,7 @@
 
 ## 最近更新
 
+- **M4** — 未定价请求不再只显示总数：费用卡按原因拆分（中断 / 传输失败 / 无 usage / 未配置价格 / 未知），明细 Tab 增加「只看未定价」筛选并显示每条请求的原因。
 - **M3** — 「会话」Tab 可点击进入单会话详情：默认含子代理子树、可切换仅本会话；迷你看板含会话卡、purpose、模型、内容来源、工具分组、搜索/抓取、趋势、子会话与请求明细；父/子会话可导航，切换 Tab 保留选中，范围变化重算。
 - **M2.10** — 自动审查（auto-review）每次重发的合成 user 角色转录从**用户**中拆出，单列为**自动审查**内容来源分组（保留明细已迁移；更早只有日聚合的日期不变；真正的聊天用户文本仅占聊天 prompt 约 0.5%）。
 - **M2.8** — 默认工具分组更丰富（`files`、`shell`、`web`、`session`、`goals`、`schedule`、`subagents`、`plugins`、`browser`、`workflow`），并支持任意自定义分组键。
@@ -61,7 +62,7 @@ node --check index.js
 node --test --test-isolation=none "test/*.test.mjs"
 ```
 
-当前单测为 **285 个**（2026-11-13 实测；M3 收尾期间数量可能继续变化，按近似值看待）。测试使用 `node:test`、合成 fixture 与临时 `DSH_HOME`，不会读写真实 profile。在 DSH Windows 沙箱内请使用上面的 in-process runner（`--test-isolation=none`）：默认 runner 以管道 stdio 启动子进程，会报 `spawn EPERM`。
+当前单测为 **287 个**（2026-11-13 实测；M4 收尾期间数量可能继续变化，按近似值看待）。测试使用 `node:test`、合成 fixture 与临时 `DSH_HOME`，不会读写真实 profile。在 DSH Windows 沙箱内请使用上面的 in-process runner（`--test-isolation=none`）：默认 runner 以管道 stdio 启动子进程，会报 `spawn EPERM`。
 
 要求 Node.js 24+，DSH 引擎范围为 `>=0.2.1-rc.1 <0.3.0`；零运行时依赖、无构建步骤。
 

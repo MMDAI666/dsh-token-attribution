@@ -5151,3 +5151,62 @@ test('M3 vanished parent keeps surviving child sessions navigable', () => {
   child.props.onClick()
   assert.deepEqual(opened, ['child-session'])
 })
+test('M4 unpriced reasons render on the cost card and in the Details filter', () => {
+  const plugin = captured.factory(fakeRequire)
+  const {
+    components,
+    normalizeSummary,
+    normalizeRequests,
+    createDetailsState,
+    detailsReducer,
+    detailsRequestPayload,
+    summaryCardModels,
+    locales,
+  } = plugin.__test
+  const t = makeT26('zh')
+  const summary = normalizeSummary({
+    totals: { requests: 13, promptTokens: 100 },
+    cost: { amount: 0, priced: false, unpricedRequests: 13, currency: 'CNY' },
+    unpricedReasons: { aborted: 9, transport: 4 },
+    range: { from: '2026-11-01', to: '2026-11-13' },
+  })
+  assert.deepEqual(summary.unpricedReasons, { aborted: 9, transport: 4 })
+  const costCard = summaryCardModels(t, summary).find(card => card.key === 'cost')
+  assert.ok(costCard.hint.includes('未定价请求：13'))
+  assert.ok(costCard.hint.includes('中断 9'))
+  assert.ok(costCard.hint.includes('传输失败 4'))
+
+  const page = normalizeRequests({
+    items: [
+      { ts: 1, cost: { amount: 0, priced: false, currency: 'CNY' }, usage: null, usageEstimated: true, error: { code: 'ABORTED' } },
+      { ts: 2, cost: { amount: 0.01, priced: true, currency: 'CNY' }, usage: { input: 1 }, error: null },
+    ],
+    total: 2,
+  })
+  assert.equal(page.items.find(row => row.ts === 1).unpricedReason, 'aborted')
+  assert.equal(page.items.find(row => row.ts === 2).unpricedReason, '')
+
+  const state = {
+    ...createDetailsState('2026-11-01|2026-11-13'),
+    status: 'ready',
+    items: page.items,
+    total: 2,
+    unpricedOnly: true,
+  }
+  const view = components.DetailsTab({ t, state, sessions: [], sessionTitles: null })
+  const text = textOfM26(view)
+  assert.ok(text.includes('只看未定价'))
+  assert.ok(text.includes('未定价原因'))
+  assert.ok(text.includes('中断'))
+  assert.equal(detailsRequestPayload({ from: '2026-11-01', to: '2026-11-13' }, { unpricedOnly: true }).unpricedOnly, true)
+  assert.equal(detailsReducer(state, { type: 'filters', unpricedOnly: false }).unpricedOnly, false)
+
+  for (const locale of ['zh', 'en']) {
+    const dict = locales[locale]
+    assert.ok(dict['details.unpricedOnly'])
+    assert.ok(dict['details.unpricedReason'])
+    assert.ok(dict['card.costUnpricedReasons'])
+    assert.ok(dict['unpriced.aborted'])
+    assert.ok(dict['unpriced.transport'])
+  }
+})

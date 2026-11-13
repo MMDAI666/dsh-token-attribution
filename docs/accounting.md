@@ -75,6 +75,8 @@ amount = Σ tokens(bucket) × price(bucket, tier) / 1,000,000
 
 All amounts remain configured-price estimates, not a provider bill.
 
+Unpriced requests are counted separately and are never assigned a fabricated cost. Since M4, `summary.unpricedReasons` splits the count by cause: `aborted`, `transport`, `no-usage`, `no-price`, and `other`; a legacy daily file without the reason map contributes an `unknown` remainder. The cost card renders this breakdown, and the Details tab can filter to unpriced rows and shows the per-request reason. A request is `no-price` when the Host has measured usage but no matching price entry, and `no-usage` when the provider returned no usage (aborted/transport failures take precedence).
+
 ## Web API counts and estimates
 
 The Host observes the outcome of every `web_search` and `web_fetch` dispatch through the global `tools/result` hook and records it in a separate per-day file, `webapi/<YYYY-MM-DD>.json`, using the host-local day bucket (the same one as `requests/` and `daily/`). These counters are deliberately outside the request JSONL and daily aggregates, so detail rebuilds and cost repricing never touch them; `retainDailyDays` prunes them.

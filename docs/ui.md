@@ -69,13 +69,13 @@ A session whose calls all failed still appears, with an em-dash cost (only succe
 The Details tab is the only place that calls the `requests` endpoint. It sends the visible summary bounds plus a 20-row window:
 
 ```json
-{ "from": "2026-11-01", "to": "2026-11-07", "limit": 20, "offset": 0, "purpose": "chat", "sessionId": "session-…" }
+{ "from": "2026-11-01", "to": "2026-11-07", "limit": 20, "offset": 0, "purpose": "chat", "sessionId": "session-…", "unpricedOnly": true }
 ```
 
-- The purpose filter is all / chat / auto-review / compaction / session-title; the session filter is all plus up to 100 sessions from `summary.bySession`, labelled with the resolved title and a short id.
-- `purpose` and `sessionId` are omitted when the filter is `all`; `sessionId` is only sent for a concrete selection.
-- Changing the range, purpose, or session resets pagination to offset 0. **加载更多 / Load more** appends the next 20 rows until the Host's filtered `total`.
-- The table columns are time, session (resolved title, full id in the tooltip), purpose, prompt, output, cacheRead, and cost.
+- The purpose filter is all / chat / auto-review / compaction / session-title; the session filter is all plus up to 100 sessions from `summary.bySession`, labelled with the resolved title and a short id. The **只看未定价 / Unpriced only** checkbox keeps rows whose cost is not priced.
+- `purpose` and `sessionId` are omitted when the filter is `all`; `sessionId` is only sent for a concrete selection; `unpricedOnly` is sent only when checked.
+- Changing the range, purpose, session, or unpriced filter resets pagination to offset 0. **加载更多 / Load more** appends the next 20 rows until the Host's filtered `total`.
+- The table columns are time, session (resolved title, full id in the tooltip), purpose, prompt, output, cacheRead, cost, and the unpriced reason (中断 / 传输失败 / 无 usage / 未配置价格 / 未知; empty for priced rows).
 - A range change that resolves new `from`/`to` (for example across midnight) resets the pane to page 1, so pages from two windows are never mixed. A mid-list RPC failure keeps already-loaded rows visible; retry re-requests the current window.
 - Against a pre-M2.6 Host that does not accept `sessionId`, picking a concrete session returns `bad-request` and the pane shows the error with retry. With no session selected the old payload shape is used.
 

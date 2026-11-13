@@ -72,6 +72,9 @@ export const INSTALLED_VERSION = '0.1.0'
  */
 export const AUTO_REVIEW_CATEGORY_VERSION = 1
 
+/** Version of the one-time unpriced-reason backfill in `meta.unpricedReasonVersion`. */
+export const UNPRICED_REASON_VERSION = 1
+
 /** Queue length that forces an immediate flush. */
 const FLUSH_THRESHOLD = 50
 
@@ -158,6 +161,10 @@ export function createDayAggregate(day) {
     byHour: {},
     cache: { input: 0, read: 0, write: 0 },
     cost: { amount: 0, priced: false, unpricedRequests: 0, currency: 'CNY' },
+    // Counts of unpriced requests by reason (M4): aborted/transport/no-usage/
+    // no-price/other. Older daily files leave this empty; finalizeSummary
+    // attributes the unexplained remainder to `unknown`.
+    unpricedReasons: {},
     // Per-currency breakdown introduced in M2. A null prototype keeps a
     // configured currency named like an Object built-in from polluting it.
     costByCurrency: Object.create(null),
@@ -329,6 +336,26 @@ function addRecordCostToTally(tally, cost) {
     target.unpricedRequests += 1
   }
   return tally
+}
+
+/**
+ * Classify why one request has no priced cost.
+ *
+ * Measured-but-unpriced means the price table lacks the provider/model;
+ * estimated/no-usage means the provider returned no `usage` (abort/transport
+ * failures are checked first so the user sees the actionable cause).
+ * @param {object} record - detail record.
+ * @returns {string|null} reason key, or null when the record is priced.
+ */
+function unpricedReasonForRecord(record) {
+  if (record?.cost?.priced === true) return null
+  const errorCode = String(record?.error?.code ?? record?.error ?? '').toUpperCase()
+  if (errorCode === 'ABORTED') return 'aborted'
+  if (errorCode === 'TRANSPORT' || errorCode === 'TIMEOUT' || errorCode === 'NETWORK'
+    || errorCode === 'ECONNRESET' || errorCode === 'ETIMEDOUT') return 'transport'
+  if (record?.usage == null || record?.usageEstimated === true) return 'no-usage'
+  if (record?.usage === null || typeof record.usage !== 'object') return 'no-usage'
+  return 'no-price'
 }
 
 /**
@@ -565,6 +592,11 @@ export function addRecordToAggregate(aggregate, record) {
   const aggregateTally = aggregateCostTally(aggregate)
   addRecordCostToTally(aggregateTally, cost)
   aggregate.cost = finalizeCost(aggregateTally)
+  const reason = unpricedReasonForRecord(record)
+  if (reason !== null) {
+    aggregate.unpricedReasons ??= {}
+    aggregate.unpricedReasons[reason] = (aggregate.unpricedReasons[reason] ?? 0) + 1
+  }
   // Every aggregate that has seen an M2 record carries the per-entity cost
   // schema from now on, so a later daily write upgrades the persisted file.
   aggregate.costSchemaVersion = COST_SCHEMA_VERSION
@@ -656,6 +688,15 @@ function normalizeAggregate(value, day) {
   mergeAggregateCostToTally(tally, value.costByCurrency, value.cost)
   aggregate.costByCurrency = tally.byCurrency
   aggregate.cost = finalizeCost(tally)
+  aggregate.unpricedReasons = {}
+  if (value.unpricedReasons !== null && typeof value.unpricedReasons === 'object'
+    && !Array.isArray(value.unpricedReasons)) {
+    for (const [reason, count] of mapEntries(value.unpricedReasons)) {
+      if (typeof reason === 'string' && reason.length > 0) {
+        aggregate.unpricedReasons[reason] = num(count)
+      }
+    }
+  }
   aggregate.costSchemaVersion = Number.isInteger(value.costSchemaVersion) ? value.costSchemaVersion : 0
   aggregate.requestCount = num(value.requestCount)
   aggregate.attemptCount = num(value.attemptCount)
@@ -1277,6 +1318,58 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
     return { ok: failures === 0, scannedDays, changedDays, changedRecords, skippedDays, failures }
   }
 
+  /**
+   * Backfill unpriced-reason counts on retained daily aggregates.
+   *
+   * Older daily files only carry `cost.unpricedRequests`; the per-request cause
+   * (aborted/transport/no-usage/no-price) only exists in the retained detail
+   * rows. For each day with both a daily file and detail, count the rows and
+   * attach the map without touching any other aggregate value. Missing daily
+   * files are left for the normal detail replay.
+   * @returns {{ok: boolean, scannedDays: number, updatedDays: number, failures: number}} result.
+   */
+  function backfillUnpricedReasons() {
+    const today = dayKey(nowMs())
+    const days = dayKeysBetween(shiftDays(today, -(requestRetention - 1)), today)
+    let scannedDays = 0
+    let updatedDays = 0
+    let failures = 0
+    for (const day of days) {
+      const daily = readJsonFile(dailyPath(day))
+      if (daily === null || typeof daily !== 'object' || daily.v !== 1) continue
+      let text
+      try {
+        text = fs.readFileSync(requestsPath(day), 'utf8')
+      } catch {
+        continue
+      }
+      scannedDays += 1
+      const reasons = {}
+      for (const line of text.split('\n')) {
+        if (line.length === 0) continue
+        let record
+        try {
+          record = JSON.parse(line)
+        } catch {
+          continue
+        }
+        const reason = unpricedReasonForRecord(record)
+        if (reason === null) continue
+        reasons[reason] = (reasons[reason] ?? 0) + 1
+      }
+      try {
+        const aggregate = normalizeAggregate(daily, day)
+        aggregate.unpricedReasons = reasons
+        atomicWriteFileSync(dailyPath(day), JSON.stringify(aggregate))
+        updatedDays += 1
+      } catch (error) {
+        failures += 1
+        report(`cannot backfill unpriced reasons for daily/${day}.json: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return { ok: failures === 0, scannedDays, updatedDays, failures }
+  }
+
   const effectiveProfileSource = adopted
     ? 'adopted-legacy-default'
     : (typeof profileSource === 'string' ? profileSource : 'fallback')
@@ -1300,6 +1393,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       // 0 means the auto-review category migration has not run yet; version 1
       // is stamped once the retained-detail pass succeeds.
       autoReviewCategoryVersion: 0,
+      unpricedReasonVersion: 0,
     }
   } else {
     meta = {
@@ -1316,6 +1410,9 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       pricingFingerprint: typeof existingMeta.pricingFingerprint === 'string' ? existingMeta.pricingFingerprint : null,
       autoReviewCategoryVersion: Number.isInteger(existingMeta.autoReviewCategoryVersion)
         ? existingMeta.autoReviewCategoryVersion
+        : 0,
+      unpricedReasonVersion: Number.isInteger(existingMeta.unpricedReasonVersion)
+        ? existingMeta.unpricedReasonVersion
         : 0,
     }
   }
@@ -1374,6 +1471,24 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       }
     } catch (error) {
       report(`auto-review category migration crashed (${error instanceof Error ? error.message : String(error)}); keeping the previous marker so the next start retries`)
+    }
+  }
+
+  // Backfill unpriced reasons once, after the auto-review daily rewrites so the
+  // reason map lands on the final aggregate for every retained day.
+  if (!readOnly && (meta.unpricedReasonVersion ?? 0) < UNPRICED_REASON_VERSION) {
+    try {
+      const backfill = backfillUnpricedReasons()
+      if (backfill.ok) {
+        meta.unpricedReasonVersion = UNPRICED_REASON_VERSION
+        if (backfill.updatedDays > 0) {
+          report(`backfilled unpriced reasons for ${backfill.updatedDays} day(s)`)
+        }
+      } else {
+        report(`unpriced reason backfill incomplete (${backfill.failures} failure(s)); keeping the previous marker so the next start retries`)
+      }
+    } catch (error) {
+      report(`unpriced reason backfill crashed (${error instanceof Error ? error.message : String(error)}); keeping the previous marker so the next start retries`)
     }
   }
 
@@ -1969,6 +2084,11 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
     summary.cache.input += num(aggregate.cache?.input)
     summary.cache.read += num(aggregate.cache?.read)
     summary.cache.write += num(aggregate.cache?.write)
+    for (const [reason, count] of mapEntries(aggregate.unpricedReasons)) {
+      if (typeof reason === 'string' && reason.length > 0) {
+        summary.unpricedReasons[reason] = (summary.unpricedReasons[reason] ?? 0) + num(count)
+      }
+    }
     mergeAggregateCostToTally(summary.costTally, aggregate.costByCurrency, aggregate.cost)
   }
 
@@ -2011,6 +2131,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       byDay: [],
       cache: { input: 0, read: 0, write: 0, hitRate: 0 },
       cost: { amount: 0, priced: false, unpricedRequests: 0, currency: 'CNY' },
+      unpricedReasons: {},
       data: {
         since,
         retention: { requestDays: requestRetention, dailyDays: dailyRetention },
@@ -2114,6 +2235,12 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       : 0
     summary.totals.costByCurrency = costByCurrencyValue(summary.costTally)
     summary.cost = finalizeCost(summary.costTally)
+    // Older daily files carry no reason map; keep the card total honest by
+    // exposing the unexplained remainder as `unknown` instead of dropping it.
+    const knownUnpriced = Object.values(summary.unpricedReasons)
+      .reduce((sum, value) => sum + num(value), 0)
+    const unknownUnpriced = num(summary.cost.unpricedRequests) - knownUnpriced
+    if (unknownUnpriced > 0) summary.unpricedReasons.unknown = unknownUnpriced
     delete summary.costTally
     delete summary.purposeCostMap
     delete summary.sessionMap
@@ -2548,6 +2675,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       ? new Set(query.sessionIds.filter(id => typeof id === 'string' && id.length > 0))
       : null
     const sessionIdsFilterActive = sessionIdsFilter !== null && sessionIdsFilter.size > 0
+    const unpricedOnly = query?.unpricedOnly === true
     let days
     if (isValidDayKey(query?.date)) {
       days = [query.date]
@@ -2578,6 +2706,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
         // matches a non-empty filter.
         if (sessionIdFilter !== null && record.sessionId !== sessionIdFilter) continue
         if (sessionIdsFilterActive && !sessionIdsFilter.has(record.sessionId)) continue
+        if (unpricedOnly && record.cost?.priced === true) continue
         items.push(record)
       }
     }
@@ -2604,6 +2733,9 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       profileSource: typeof meta.profileSource === 'string' ? meta.profileSource : 'unknown',
       autoReviewCategoryVersion: Number.isInteger(meta.autoReviewCategoryVersion)
         ? meta.autoReviewCategoryVersion
+        : 0,
+      unpricedReasonVersion: Number.isInteger(meta.unpricedReasonVersion)
+        ? meta.unpricedReasonVersion
         : 0,
       readOnly,
       pointerStatus,

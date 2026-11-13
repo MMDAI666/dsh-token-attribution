@@ -2830,3 +2830,31 @@ test('readSessionDetail reads web API counters beyond the 100-row session cap', 
   assert.deepEqual(detail.webApi.bySession.map(row => row.sessionId), ['s100'])
   store.dispose()
 })
+test('summary exposes unpriced reasons and requests can filter unpriced rows', (t) => {
+  const home = tempHome(t)
+  const store = createStore({ config: makeConfig(), homeDir: home, profile: 'test' })
+  const day = dayKey(Date.now())
+  const ts = Date.now()
+  const unpriced = { amount: 0, priced: false, currency: 'CNY', priceVersion: 'none' }
+  store.append(makeRecord({ id: 'aborted', ts, cost: unpriced, usage: null, usageEstimated: true, error: { code: 'ABORTED' } }))
+  store.append(makeRecord({ id: 'transport', ts: ts + 1, cost: unpriced, usage: null, usageEstimated: true, error: { code: 'TRANSPORT' } }))
+  store.append(makeRecord({ id: 'no-usage', ts: ts + 2, cost: unpriced, usage: null, usageEstimated: true, error: null }))
+  store.append(makeRecord({ id: 'no-price', ts: ts + 3, cost: unpriced }))
+  store.append(makeRecord({ id: 'priced', ts: ts + 4 }))
+  store.flush()
+
+  const summary = store.readSummary({ from: day, to: day })
+  assert.equal(summary.cost.unpricedRequests, 4)
+  assert.deepEqual(summary.unpricedReasons, {
+    aborted: 1,
+    transport: 1,
+    'no-usage': 1,
+    'no-price': 1,
+  })
+
+  const page = store.readRequests({ from: day, to: day, unpricedOnly: true, limit: 20 })
+  assert.equal(page.total, 4)
+  assert.deepEqual(page.items.map(row => row.id).sort(), ['aborted', 'no-price', 'no-usage', 'transport'])
+  assert.equal(store.readRequests({ from: day, to: day, unpricedOnly: false }).total, 5)
+  store.dispose()
+})

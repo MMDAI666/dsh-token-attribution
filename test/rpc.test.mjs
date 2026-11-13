@@ -176,6 +176,7 @@ test('requests validates limit, offset, dates, and purpose', async () => {
     purpose: 'chat',
     sessionId: undefined,
     sessionIds: undefined,
+    unpricedOnly: false,
   }])
 
   for (const payload of [
@@ -187,6 +188,8 @@ test('requests validates limit, offset, dates, and purpose', async () => {
     { date: '2026-13-01' },
     { purpose: '' },
     { purpose: 42 },
+    { unpricedOnly: 'yes' },
+    { unpricedOnly: 1 },
   ]) {
     const result = await handler('requests', payload)
     assert.equal(result.ok, false, JSON.stringify(payload))
@@ -214,6 +217,7 @@ test('requests passes sessionId through and rejects an invalid one', async () =>
     purpose: 'chat',
     sessionId: 'session-1',
     sessionIds: undefined,
+    unpricedOnly: false,
   }])
 
   // An unknown session id is a valid filter; the store decides it matches nothing.
