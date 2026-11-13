@@ -1,0 +1,13 @@
+node_modules/
+coverage/
+*.log
+.DS_Store
+Thumbs.db
+*.tmp
+
+# 本地私有材料（不进入公开仓库）
+evidence/
+PLAN.md
+AGENTS.md
+docs/milestones.md
+.idea/

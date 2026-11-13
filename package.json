@@ -1,0 +1,49 @@
+{
+  "name": "dsh-token-attribution",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Real-time token usage attribution for DSH model calls, including non-persisted calls such as auto-review.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "src/host/*.mjs",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.zh.md",
+    "docs",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.1 <0.3.0",
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test --test-isolation=none \"test/*.test.mjs\""
+  }
+}
