@@ -75,6 +75,9 @@ export const AUTO_REVIEW_CATEGORY_VERSION = 1
 /** Version of the one-time unpriced-reason backfill in `meta.unpricedReasonVersion`. */
 export const UNPRICED_REASON_VERSION = 1
 
+/** Version of the one-time per-model cache-bucket backfill in `meta.modelCacheVersion`. */
+export const MODEL_CACHE_VERSION = 1
+
 /** Queue length that forces an immediate flush. */
 const FLUSH_THRESHOLD = 50
 
@@ -566,10 +569,23 @@ export function addRecordToAggregate(aggregate, record) {
   const provider = typeof record.provider === 'string' ? record.provider : 'unknown'
   const model = typeof record.model === 'string' ? record.model : 'unknown'
   const modelKey = `${provider}/${model}`
-  const modelEntry = aggregate.byModel[modelKey] ??= { provider, model, requests: 0, promptTokens: 0, outputTokens: 0 }
+  const modelEntry = aggregate.byModel[modelKey] ??= {
+    provider,
+    model,
+    requests: 0,
+    promptTokens: 0,
+    outputTokens: 0,
+    cache: { input: 0, read: 0, write: 0 },
+  }
   modelEntry.requests += 1
   modelEntry.promptTokens += promptTokens
   modelEntry.outputTokens += outputTokens
+  if (usage !== null) {
+    const modelCache = modelEntry.cache ??= { input: 0, read: 0, write: 0 }
+    modelCache.input += num(usage.input)
+    modelCache.read += num(usage.cacheRead)
+    modelCache.write += num(usage.cacheWrite)
+  }
 
   const ts = typeof record.ts === 'number' && Number.isFinite(record.ts) ? record.ts : nowMs()
   const hour = String(new Date(ts).getHours())
@@ -639,6 +655,8 @@ function normalizeEntityEntry(value, kind) {
     entry.requests = num(source.requests)
     entry.promptTokens = num(source.promptTokens)
     entry.outputTokens = num(source.outputTokens)
+    const cache = source.cache !== null && typeof source.cache === 'object' ? source.cache : {}
+    entry.cache = { input: num(cache.input), read: num(cache.read), write: num(cache.write) }
   }
   return entry
 }
@@ -1319,6 +1337,69 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
   }
 
   /**
+   * Backfill per-model cache buckets on retained daily aggregates.
+   *
+   * Older daily files store only prompt/output per model; the model split of
+   * the input columns needs measured cache buckets from the retained detail
+   * rows. Only the `byModel[*].cache` fields are updated; every other aggregate
+   * value stays untouched.
+   * @returns {{ok: boolean, scannedDays: number, updatedDays: number, failures: number}} result.
+   */
+  function backfillModelCache() {
+    const today = dayKey(nowMs())
+    const days = dayKeysBetween(shiftDays(today, -(requestRetention - 1)), today)
+    let scannedDays = 0
+    let updatedDays = 0
+    let failures = 0
+    for (const day of days) {
+      const daily = readJsonFile(dailyPath(day))
+      if (daily === null || typeof daily !== 'object' || daily.v !== 1) continue
+      let text
+      try {
+        text = fs.readFileSync(requestsPath(day), 'utf8')
+      } catch {
+        continue
+      }
+      scannedDays += 1
+      const caches = new Map()
+      for (const line of text.split('\n')) {
+        if (line.length === 0) continue
+        let record
+        try {
+          record = JSON.parse(line)
+        } catch {
+          continue
+        }
+        const usage = record?.usage
+        if (usage === null || typeof usage !== 'object') continue
+        const provider = typeof record.provider === 'string' ? record.provider : 'unknown'
+        const model = typeof record.model === 'string' ? record.model : 'unknown'
+        const key = `${provider}/${model}`
+        let cache = caches.get(key)
+        if (cache === undefined) {
+          cache = { input: 0, read: 0, write: 0 }
+          caches.set(key, cache)
+        }
+        cache.input += num(usage.input)
+        cache.read += num(usage.cacheRead)
+        cache.write += num(usage.cacheWrite)
+      }
+      try {
+        const aggregate = normalizeAggregate(daily, day)
+        for (const [key, entry] of Object.entries(aggregate.byModel)) {
+          entry.cache = caches.get(key) ?? { input: 0, read: 0, write: 0 }
+        }
+        atomicWriteFileSync(dailyPath(day), JSON.stringify(aggregate))
+        updatedDays += 1
+      } catch (error) {
+        failures += 1
+        report(`cannot backfill model cache for daily/${day}.json: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return { ok: failures === 0, scannedDays, updatedDays, failures }
+  }
+
+  /**
    * Backfill unpriced-reason counts on retained daily aggregates.
    *
    * Older daily files only carry `cost.unpricedRequests`; the per-request cause
@@ -1394,6 +1475,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       // is stamped once the retained-detail pass succeeds.
       autoReviewCategoryVersion: 0,
       unpricedReasonVersion: 0,
+      modelCacheVersion: 0,
     }
   } else {
     meta = {
@@ -1413,6 +1495,9 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
         : 0,
       unpricedReasonVersion: Number.isInteger(existingMeta.unpricedReasonVersion)
         ? existingMeta.unpricedReasonVersion
+        : 0,
+      modelCacheVersion: Number.isInteger(existingMeta.modelCacheVersion)
+        ? existingMeta.modelCacheVersion
         : 0,
     }
   }
@@ -1489,6 +1574,24 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       }
     } catch (error) {
       report(`unpriced reason backfill crashed (${error instanceof Error ? error.message : String(error)}); keeping the previous marker so the next start retries`)
+    }
+  }
+
+  // Per-model cache buckets were added after the daily schema; backfill them
+  // from retained detail so the three-way token columns work for old ranges.
+  if (!readOnly && (meta.modelCacheVersion ?? 0) < MODEL_CACHE_VERSION) {
+    try {
+      const backfill = backfillModelCache()
+      if (backfill.ok) {
+        meta.modelCacheVersion = MODEL_CACHE_VERSION
+        if (backfill.updatedDays > 0) {
+          report(`backfilled model cache buckets for ${backfill.updatedDays} day(s)`)
+        }
+      } else {
+        report(`model cache backfill incomplete (${backfill.failures} failure(s)); keeping the previous marker so the next start retries`)
+      }
+    } catch (error) {
+      report(`model cache backfill crashed (${error instanceof Error ? error.message : String(error)}); keeping the previous marker so the next start retries`)
     }
   }
 
@@ -2073,11 +2176,15 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
         requests: 0,
         promptTokens: 0,
         outputTokens: 0,
+        cache: { input: 0, read: 0, write: 0 },
         costTally: createCostTally(),
       }
       target.requests += num(entry?.requests)
       target.promptTokens += num(entry?.promptTokens)
       target.outputTokens += num(entry?.outputTokens)
+      target.cache.input += num(entry?.cache?.input)
+      target.cache.read += num(entry?.cache?.read)
+      target.cache.write += num(entry?.cache?.write)
       mergeEntityCostToTally(target.costTally, entry)
       summary.modelMap.set(modelKey, target)
     }
@@ -2157,6 +2264,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
    */
   function mergeDayIntoSummary(summary, day, parts) {
     const dayTally = createCostTally()
+    const dayCache = { input: 0, read: 0, write: 0 }
     let dayRequests = 0
     let dayPromptTokens = 0
     let dayOutputTokens = 0
@@ -2169,6 +2277,9 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       dayPromptTokens += num(part.totals.promptTokens)
       dayOutputTokens += num(part.totals.outputTokens)
       dayEstimatedRequests += num(part.totals.estimatedRequests)
+      dayCache.input += num(part.cache?.input)
+      dayCache.read += num(part.cache?.read)
+      dayCache.write += num(part.cache?.write)
       mergeAggregateCostToTally(dayTally, part.costByCurrency, part.cost)
     }
     if (dayRequests > 0) {
@@ -2178,6 +2289,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
         promptTokens: dayPromptTokens,
         outputTokens: dayOutputTokens,
         estimatedRequests: dayEstimatedRequests,
+        cache: dayCache,
         cost: finalizeCost(dayTally),
         // Same shape as `summary.totals.costByCurrency`; amounts are never
         // summed across currencies, so a mixed day keeps one entry each.
@@ -2215,6 +2327,7 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
       promptTokens: entry.promptTokens,
       outputTokens: entry.outputTokens,
       tokens: entry.promptTokens + entry.outputTokens,
+      cache: { input: entry.cache.input, read: entry.cache.read, write: entry.cache.write },
       cost: finalizeCost(entry.costTally),
     }))
     models.sort((left, right) => right.tokens - left.tokens)
@@ -2736,6 +2849,9 @@ export function createStore({ ctx, config, diag, logger: _logger, homeDir, profi
         : 0,
       unpricedReasonVersion: Number.isInteger(meta.unpricedReasonVersion)
         ? meta.unpricedReasonVersion
+        : 0,
+      modelCacheVersion: Number.isInteger(meta.modelCacheVersion)
+        ? meta.modelCacheVersion
         : 0,
       readOnly,
       pointerStatus,

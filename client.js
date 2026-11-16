@@ -453,11 +453,55 @@ window.__ModuleLoader__.load({
      * @param {unknown} value - token count.
      * @returns {string|object} text or a titled span.
      */
-    function tokenCell(value) {
+    function tokenCell(value, color) {
       const compact = formatCompactTokens(value)
       const full = formatTokens(value)
-      if (compact === full) return compact
-      return h('span', { title: full }, compact)
+      const style = typeof color === 'string' && color.length > 0 ? { color } : undefined
+      if (compact === full && style === undefined) return compact
+      return h('span', { title: full, style }, compact)
+    }
+
+    /**
+     * Split prompt tokens into uncached input, cached input (read + write), and
+     * output for the three-way token columns.
+     *
+     * Session/model rows carry a `cache` object; request rows carry the raw
+     * usage buckets plus `cacheAvailable`. Legacy rows without cache buckets
+     * keep their prompt total in the uncached column and mark the cached column
+     * unavailable instead of inventing a split.
+     * @param {object} row - session/model/request row.
+     * @returns {{available: boolean, uncached: number, output: number, cached: number|null, read: number, write: number}} split.
+     */
+    function splitTokenCounts(row) {
+      const prompt = tokenNumber(row?.promptTokens)
+      const output = tokenNumber(row?.outputTokens)
+      if (isPlainObject(row?.cache)) {
+        const read = tokenNumber(row.cache.read)
+        const write = tokenNumber(row.cache.write)
+        const cached = read + write
+        const available = tokenNumber(row.cache.input) + cached > 0 || prompt === 0
+        return {
+          available,
+          uncached: available ? Math.max(0, prompt - cached) : prompt,
+          output,
+          cached: available ? cached : null,
+          read,
+          write,
+        }
+      }
+      if (row?.cacheAvailable === true) {
+        const read = tokenNumber(row.cacheReadTokens)
+        const write = tokenNumber(row.cacheWriteTokens)
+        return {
+          available: true,
+          uncached: tokenNumber(row.cacheInputTokens),
+          output,
+          cached: read + write,
+          read,
+          write,
+        }
+      }
+      return { available: false, uncached: prompt, output, cached: null, read: 0, write: 0 }
     }
 
     /**
@@ -1765,6 +1809,7 @@ window.__ModuleLoader__.load({
         const outputTokens = tokenNumber(entry.outputTokens)
         const tokens = tokenNumber(entry.tokens) || promptTokens + outputTokens
         if (tokens === 0 && countNumber(entry.requests) === 0) continue
+        const rawCache = isPlainObject(entry.cache) ? entry.cache : {}
         models.push({
           provider: typeof entry.provider === 'string' ? entry.provider : '',
           model: typeof entry.model === 'string' ? entry.model : '',
@@ -1772,6 +1817,11 @@ window.__ModuleLoader__.load({
           promptTokens,
           outputTokens,
           tokens,
+          cache: {
+            input: tokenNumber(rawCache.input),
+            read: tokenNumber(rawCache.read),
+            write: tokenNumber(rawCache.write),
+          },
           cost: normalizeCost(entry.cost, entry.currency),
         })
       }
@@ -1794,12 +1844,18 @@ window.__ModuleLoader__.load({
         const promptTokens = tokenNumber(entry.promptTokens)
         const outputTokens = tokenNumber(entry.outputTokens)
         const tokens = tokenNumber(entry.tokens) || promptTokens + outputTokens
+        const rawCache = isPlainObject(entry.cache) ? entry.cache : {}
         days.push({
           day,
           requests: countNumber(entry.requests),
           promptTokens,
           outputTokens,
           tokens,
+          cache: {
+            input: tokenNumber(rawCache.input),
+            read: tokenNumber(rawCache.read),
+            write: tokenNumber(rawCache.write),
+          },
           estimatedRequests: countNumber(entry.estimatedRequests),
           cost: normalizeCost(entry.cost, entry.currency),
         })
@@ -1854,6 +1910,9 @@ window.__ModuleLoader__.load({
           promptTokens: tokenNumber(entry.promptTokens ?? entry.prompt),
           outputTokens: tokenNumber(entry.outputTokens ?? entry.output),
           cacheReadTokens: tokenNumber(entry.cacheReadTokens ?? entry.cacheRead ?? entry.usage?.cacheRead),
+          cacheInputTokens: tokenNumber(entry.usage?.input),
+          cacheWriteTokens: tokenNumber(entry.usage?.cacheWrite),
+          cacheAvailable: isPlainObject(entry.usage),
           cost: normalizeCost(entry.cost, entry.currency),
           unpricedReason: requestUnpricedReason(entry),
         })
@@ -3294,13 +3353,23 @@ window.__ModuleLoader__.load({
         height: safeHeight,
         count: 0,
         maxTotal: 0,
-        totals: { promptTokens: 0, outputTokens: 0, tokens: 0, requests: 0 },
+        totals: {
+          promptTokens: 0,
+          inputUncachedTokens: 0,
+          inputCachedTokens: 0,
+          outputTokens: 0,
+          tokens: 0,
+          requests: 0,
+        },
         points: [],
       }
       if (safeWidth === 0 || safeHeight === 0 || days.length === 0) return layout
       let maxTotal = 1
       for (const day of days) {
+        const cached = day.cache.read + day.cache.write
         layout.totals.promptTokens += day.promptTokens
+        layout.totals.inputUncachedTokens += Math.max(0, day.promptTokens - cached)
+        layout.totals.inputCachedTokens += cached
         layout.totals.outputTokens += day.outputTokens
         layout.totals.tokens += day.tokens
         layout.totals.requests += day.requests
@@ -3315,10 +3384,14 @@ window.__ModuleLoader__.load({
       layout.count = count
       layout.maxTotal = maxTotal
       layout.points = days.map((day, index) => {
-        const promptHeight = (day.promptTokens / maxTotal) * safeHeight
+        const cached = day.cache.read + day.cache.write
+        const uncached = Math.max(0, day.promptTokens - cached)
+        const inputUncachedHeight = (uncached / maxTotal) * safeHeight
+        const inputCachedHeight = (cached / maxTotal) * safeHeight
         const outputHeight = (day.outputTokens / maxTotal) * safeHeight
-        const promptY = safeHeight - promptHeight
-        const outputY = promptY - outputHeight
+        const inputUncachedY = safeHeight - inputUncachedHeight
+        const outputY = inputUncachedY - outputHeight
+        const inputCachedY = outputY - inputCachedHeight
         return {
           key: day.day,
           index,
@@ -3327,15 +3400,19 @@ window.__ModuleLoader__.load({
           x: index * (slotWidth + gap) + (slotWidth - barWidth) / 2,
           barWidth,
           promptTokens: day.promptTokens,
+          inputUncachedTokens: uncached,
+          inputCachedTokens: cached,
           outputTokens: day.outputTokens,
           tokens: day.tokens,
           requests: day.requests,
           cost: day.cost,
-          promptHeight,
+          inputUncachedHeight,
+          inputCachedHeight,
           outputHeight,
-          promptY,
+          inputUncachedY,
+          inputCachedY,
           outputY,
-          top: outputY,
+          top: inputCachedY,
         }
       })
       return layout
@@ -3575,7 +3652,7 @@ window.__ModuleLoader__.load({
 
         'card.total': 'Total tokens (with cache)',
         'card.totalHint': 'Measured prompt + output',
-        'card.prompt': 'Prompt tokens',
+        'card.prompt': 'Input tokens (incl. cache)',
         'card.promptHint': 'Includes cache reads and writes',
         'card.output': 'Output tokens',
         'card.outputHint': 'Reasoning is included in output',
@@ -3621,10 +3698,12 @@ window.__ModuleLoader__.load({
         'chart.legendAria': '{title} legend',
 
         'trend.title': 'By day',
-        'trend.hint': 'Prompt and output tokens per day, oldest to newest',
-        'trend.prompt': 'Prompt',
+        'trend.hint': 'Uncached input, output and cached input tokens per day, oldest to newest',
+        'trend.prompt': 'Input',
+        'trend.inputUncached': 'Input (uncached)',
         'trend.output': 'Output',
-        'trend.barTitle': '{day} · prompt {prompt} · output {output}',
+        'trend.inputCached': 'Input (cached)',
+        'trend.barTitle': '{day} · uncached {inputUncached} · output {output} · cached {inputCached}',
         'trend.empty': 'No daily data in this range',
 
         'purpose.chat': 'Main chat',
@@ -3708,13 +3787,16 @@ window.__ModuleLoader__.load({
         'table.webApiSessions.expand': 'Show all ({count})',
         'table.webApiSessions.collapse': 'Show less',
         'table.models.title': 'Models',
-        'table.models.hint': 'Measured prompt and output by provider/model',
+        'table.models.hint': 'Measured input/output by provider/model',
         'table.models.provider': 'Provider',
         'table.models.model': 'Model',
         'table.models.requests': 'Requests',
         'table.models.tokens': 'Tokens',
         'table.models.promptTokens': 'Input',
         'table.models.outputTokens': 'Output',
+        'table.tokens.inputUncached': 'Input (uncached)',
+        'table.tokens.output': 'Output',
+        'table.tokens.inputCached': 'Input (cached)',
         'table.models.empty': 'No model calls in this range',
         'table.models.unknown': 'Unknown',
         'table.models.topTitle': 'Models · Top {count}',
@@ -3805,10 +3887,12 @@ window.__ModuleLoader__.load({
         'requests.empty': 'No request detail in this range',
         'requests.failed': 'Could not load request detail.',
         'requests.time': 'Time',
-        'requests.purpose': 'purpose',
-        'requests.prompt': 'prompt',
-        'requests.output': 'output',
-        'requests.cacheRead': 'cacheRead',
+        'requests.purpose': 'Purpose',
+        'requests.prompt': 'Input',
+        'requests.inputUncached': 'Input (uncached)',
+        'requests.output': 'Output',
+        'requests.inputCached': 'Input (cached)',
+        'requests.cacheRead': 'Cache read',
 
         'export.json': 'Export JSON',
         'export.csv': 'Export CSV',
@@ -4044,12 +4128,12 @@ window.__ModuleLoader__.load({
         'range.7d': '近 7 天',
         'range.30d': '近 30 天',
 
-        'card.total': '总 tokens（含缓存）',
-        'card.totalHint': '实测 prompt + output',
-        'card.prompt': 'Prompt tokens',
+        'card.total': '总 Token（含缓存）',
+        'card.totalHint': '实测输入 + 输出',
+        'card.prompt': '输入 tokens（含缓存）',
         'card.promptHint': '包含缓存读写',
-        'card.output': 'Output tokens',
-        'card.outputHint': '推理已包含在 output 内',
+        'card.output': '输出 tokens',
+        'card.outputHint': '推理已包含在输出内',
         'card.cacheHit': '缓存命中率',
         'card.cacheHint': '读 {read} · 写 {write}',
         'card.requests': '请求数',
@@ -4074,15 +4158,15 @@ window.__ModuleLoader__.load({
         'chart.purpose.title': '按调用目的',
         'chart.purpose.hint': '所有已记录调用按目的拆分',
         'chart.category.title': '按内容来源',
-        'chart.category.hint': 'Prompt tokens 按估算的内容来源分组，展示所有有 token 的分组；原始分类明细见下方。',
-        'chart.category.hintOverview': 'Prompt tokens 按估算的内容来源分组',
+        'chart.category.hint': '输入 tokens 按估算的内容来源分组，展示所有有 token 的分组；原始分类明细见下方。',
+        'chart.category.hintOverview': '输入 tokens 按估算的内容来源分组',
         'chart.category.detailTitle': '来源明细',
         'chart.category.detailHint': '上方分组背后的全部原始归因分类',
         'chart.category.expand': '展开明细',
         'chart.category.collapse': '收起明细',
         'chart.category.detailCategory': '类别',
-        'chart.category.detailTokens': 'Tokens',
-        'chart.category.detailShare': '占 prompt',
+        'chart.category.detailTokens': 'Token 数',
+        'chart.category.detailShare': '占总输入',
         'chart.category.detailEmpty': '该范围内暂无分类明细',
         'chart.other': '其他',
         'chart.empty': '该范围内暂无数据',
@@ -4092,10 +4176,12 @@ window.__ModuleLoader__.load({
         'chart.legendAria': '{title}图例',
 
         'trend.title': '按天趋势',
-        'trend.hint': '按天拆分 prompt 与 output tokens，由旧到新',
-        'trend.prompt': 'Prompt',
-        'trend.output': 'Output',
-        'trend.barTitle': '{day} · prompt {prompt} · output {output}',
+        'trend.hint': '按天拆分输入（未缓存）、输出与输入（缓存）tokens，由旧到新',
+        'trend.prompt': '输入',
+        'trend.inputUncached': '输入（未缓存）',
+        'trend.output': '输出',
+        'trend.inputCached': '输入（缓存）',
+        'trend.barTitle': '{day} · 未缓存 {inputUncached} · 输出 {output} · 缓存 {inputCached}',
         'trend.empty': '该范围内暂无按天数据',
 
         'purpose.chat': '主对话',
@@ -4152,11 +4238,11 @@ window.__ModuleLoader__.load({
         'categoryGroup.other': '其他',
 
         'table.sessions.title': '会话 Top',
-        'table.sessions.hint': '按该范围内的实测 tokens 排序',
+        'table.sessions.hint': '按该范围内的实测 Token 排序',
         'table.sessions.session': '会话',
         'table.sessions.requests': '请求数',
-        'table.sessions.tokens': 'Tokens',
-        'table.sessions.promptTokens': '输入',
+        'table.sessions.tokens': 'Token 数',
+        'table.sessions.promptTokens': '输入（含缓存）',
         'table.sessions.outputTokens': '输出',
         'table.sessions.cacheRate': '缓存率',
         'table.sessions.expand': '展开子会话',
@@ -4167,7 +4253,7 @@ window.__ModuleLoader__.load({
         'table.sessions.unknown': '未知会话',
         'table.sessions.subagent': '子代理',
         'table.sessions.topTitle': '会话 Top {count}',
-        'table.sessions.topHint': '该范围内实测 tokens 前 {count} 的会话；行内数值含全部子会话',
+        'table.sessions.topHint': '该范围内实测 Token 前 {count} 的会话；行内数值含全部子会话',
         'table.webApiSessions.title': '搜索 / 抓取会话',
         'table.webApiSessions.topTitle': '搜索 / 抓取会话 · Top {count}',
         'table.webApiSessions.hint': '按该范围内的搜索/抓取调用排序；数据来自 Host 观测的 web_search / web_fetch 工具调用',
@@ -4179,13 +4265,16 @@ window.__ModuleLoader__.load({
         'table.webApiSessions.expand': '展开全部（{count}）',
         'table.webApiSessions.collapse': '收起',
         'table.models.title': '模型',
-        'table.models.hint': '按 provider/model 汇总实测 prompt 与 output',
-        'table.models.provider': 'Provider',
+        'table.models.hint': '按提供方/模型汇总实测输入与输出',
+        'table.models.provider': '提供方',
         'table.models.model': '模型',
         'table.models.requests': '请求数',
-        'table.models.tokens': 'Tokens',
-        'table.models.promptTokens': '输入',
+        'table.models.tokens': 'Token 数',
+        'table.models.promptTokens': '输入（含缓存）',
         'table.models.outputTokens': '输出',
+        'table.tokens.inputUncached': '输入（未缓存）',
+        'table.tokens.output': '输出',
+        'table.tokens.inputCached': '输入（缓存）',
         'table.models.empty': '该范围内暂无模型调用',
         'table.models.unknown': '未知',
         'table.models.topTitle': '模型 Top {count}',
@@ -4201,10 +4290,10 @@ window.__ModuleLoader__.load({
         'unpriced.unknown': '未知',
         'unpriced.reasonItem': '{label} {count}',
         'table.toolGroups.title': '工具分组',
-        'table.toolGroups.hint': '按工具分组汇总的 prompt tokens（含工具声明与工具结果）',
+        'table.toolGroups.hint': '按工具分组汇总的输入 tokens（含工具声明与工具结果）',
         'table.toolGroups.group': '工具分组',
-        'table.toolGroups.tokens': 'Tokens',
-        'table.toolGroups.share': '占 prompt',
+        'table.toolGroups.tokens': 'Token 数',
+        'table.toolGroups.share': '占总输入',
         'table.toolGroups.empty': '该范围内暂无工具分组数据',
         'toolGroup.memory': '记忆',
         'toolGroup.skill': '技能',
@@ -4276,10 +4365,12 @@ window.__ModuleLoader__.load({
         'requests.empty': '该范围内暂无请求明细',
         'requests.failed': '最近请求加载失败。',
         'requests.time': '时间',
-        'requests.purpose': 'purpose',
-        'requests.prompt': 'prompt',
-        'requests.output': 'output',
-        'requests.cacheRead': 'cacheRead',
+        'requests.purpose': '调用目的',
+        'requests.prompt': '输入',
+        'requests.inputUncached': '输入（未缓存）',
+        'requests.output': '输出',
+        'requests.inputCached': '输入（缓存）',
+        'requests.cacheRead': '缓存读取',
 
         'export.json': '导出 JSON',
         'export.csv': '导出 CSV',
@@ -4292,16 +4383,16 @@ window.__ModuleLoader__.load({
         'export.download.saveFailed': '浏览器保存导出文件失败。',
 
         'footnote.title': '口径说明',
-        'footnote.usage': '总量、prompt/output 与缓存数字来自每次调用返回的真实 usage；内容来源拆分是字符权重估算并按请求归一化，因此各分类之和等于实测 prompt。',
+        'footnote.usage': '总量、输入/输出与缓存数字来自每次调用返回的真实 usage；内容来源拆分是字符权重估算并按请求归一化，因此各分类之和等于实测输入。',
         'footnote.estimated': '其中 {estimated} 条请求为估算、{measured} 条为实测；估算记录在账本中有标记。',
-        'footnote.estimatedTokens': '估算 prompt tokens：{tokens} / {total}（{percent}）。',
-        'footnote.cost': '费用按配置的价目表估算，不代表 provider 账单。',
+        'footnote.estimatedTokens': '估算输入 tokens：{tokens} / {total}（{percent}）。',
+        'footnote.cost': '费用按配置的价目表估算，不代表供应商账单。',
         'footnote.costTiers': '费用按请求发生时间选择高峰或空闲单价（时区 Asia/Shanghai）：工作日 09:00–12:00、14:00–18:00 为高峰，其余时段与周末为空闲；法定节假日仅在“全天空闲日期”中列出时按空闲计。',
         'footnote.costMixed': '费用涉及多种币种，按币种分别展示、不做合并。',
         'footnote.costBreakdown': '按币种：{breakdown}；金额分币种展示、不做合并。',
         'footnote.costCurrencyItem': '{currency} {amount}（未定价 {count}）',
         'footnote.costDetailIncomplete': '部分历史日期只剩日聚合总量、明细已过保留期，因此按来源/会话/模型的费用不完整。',
-        'footnote.webApi': '搜索 / 抓取次数来自该范围内观测到的 web_search / web_fetch 工具调用；成功调用按 provider 的按次定价计费，失败调用只计数、不计费。金额是按配置的每千次单价估算的，provider 侧实际账单可能不同（例如 provider 把搜索打包进模型调用；一次工具调用可能包含多个查询，这里按一次计）。',
+        'footnote.webApi': '搜索 / 抓取次数来自该范围内观测到的 web_search / web_fetch 工具调用；成功调用按供应商的按次定价计费，失败调用只计数、不计费。金额是按配置的每千次单价估算的，供应商侧实际账单可能不同（例如供应商把搜索打包进模型调用；一次工具调用可能包含多个查询，这里按一次计）。',
         'footnote.retention': '数据自 {since} 起。明细保留 {requestDays} 天，日聚合保留 {dailyDays} 天。',
         'footnote.retentionUnknown': '保留期信息暂不可用。',
         'footnote.readOnly': '数据目录处于只读状态；宿主仍会观察调用，但新记录无法写入。',
@@ -4310,7 +4401,7 @@ window.__ModuleLoader__.load({
         'footnote.migration': '检测到数据目录变更，需要迁移。请在设置面板中保存配置以启动迁移。',
         'footnote.migrationStatus': '数据目录迁移状态：{status}。',
         'footnote.generated': '汇总生成于 {time}。',
-        'footnote.privacy': '隐私：账本仅保存数字、分类名、sessionId、哈希、provider 与 model，不保存提示词原文。',
+        'footnote.privacy': '隐私：账本仅保存数字、分类名、sessionId、哈希、供应商与模型，不保存提示词原文。',
         'footnote.source': 'Host RPC 通道：{channel}',
 
         'state.loading': '正在加载用量…',
@@ -4409,7 +4500,7 @@ window.__ModuleLoader__.load({
         'config.pricing.add': '添加价目条目',
         'config.pricing.remove': '删除价目条目 {index}',
         'config.pricing.rowLabel': '价目条目 {index}',
-        'config.pricing.provider': 'Provider',
+        'config.pricing.provider': '供应商',
         'config.pricing.model': '模型（精确、前缀* 或 *）',
         'config.pricing.currency': '币种',
         'config.pricing.inputPerMillion': '输入 / 百万',
@@ -4517,6 +4608,13 @@ window.__ModuleLoader__.load({
 
     const FONT_STACK = 'var(--dsw-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif)'
     const MONO_STACK = 'var(--dsw-font-family-code, ui-monospace, SFMono-Regular, Consolas, monospace)'
+
+    // Token-kind colors; input/output/cached stay distinct in tables and cards.
+    const TOKEN_COLORS = Object.freeze({
+      input: seriesColor(0),
+      output: seriesColor(1),
+      cached: seriesColor(2),
+    })
 
     /**
      * Base surface style.
@@ -4722,11 +4820,13 @@ window.__ModuleLoader__.load({
      * @returns {object} React element.
      */
     function MetricCard(props) {
-      const toneColor = props.tone === 'accent'
-        ? COLORS.brand
-        : props.tone === 'warning'
-          ? COLORS.warning
-          : COLORS.text
+      const toneColor = typeof props.valueColor === 'string' && props.valueColor.length > 0
+        ? props.valueColor
+        : props.tone === 'accent'
+          ? COLORS.brand
+          : props.tone === 'warning'
+            ? COLORS.warning
+            : COLORS.text
       const lines = Array.isArray(props.lines) ? props.lines : []
       return h('div', {
         style: surfaceStyle({ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 4 }),
@@ -4929,8 +5029,9 @@ window.__ModuleLoader__.load({
         }
       }
       const legend = [
-        { key: 'prompt', label: t('trend.prompt'), value: layout.totals.promptTokens },
+        { key: 'inputUncached', label: t('trend.inputUncached'), value: layout.totals.inputUncachedTokens },
         { key: 'output', label: t('trend.output'), value: layout.totals.outputTokens },
+        { key: 'inputCached', label: t('trend.inputCached'), value: layout.totals.inputCachedTokens },
       ]
       return h('section', {
         style: surfaceStyle({ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }),
@@ -4955,16 +5056,17 @@ window.__ModuleLoader__.load({
             }, points.map(point => h('g', { key: `day-${point.key}` }, [
               h('title', { key: 'title' }, t('trend.barTitle', {
                 day: point.label || point.day,
-                prompt: formatCompactTokens(point.promptTokens),
+                inputUncached: formatCompactTokens(point.inputUncachedTokens),
                 output: formatCompactTokens(point.outputTokens),
+                inputCached: formatCompactTokens(point.inputCachedTokens),
               })),
-              point.promptHeight > 0
+              point.inputUncachedHeight > 0
                 ? h('rect', {
-                  key: 'prompt',
+                  key: 'inputUncached',
                   x: point.x,
-                  y: point.promptY,
+                  y: point.inputUncachedY,
                   width: point.barWidth,
-                  height: point.promptHeight,
+                  height: point.inputUncachedHeight,
                   fill: seriesColor(0),
                 })
                 : null,
@@ -4976,6 +5078,16 @@ window.__ModuleLoader__.load({
                   width: point.barWidth,
                   height: point.outputHeight,
                   fill: seriesColor(1),
+                })
+                : null,
+              point.inputCachedHeight > 0
+                ? h('rect', {
+                  key: 'inputCached',
+                  x: point.x,
+                  y: point.inputCachedY,
+                  width: point.barWidth,
+                  height: point.inputCachedHeight,
+                  fill: seriesColor(2),
                 })
                 : null,
             ]))),
@@ -5223,13 +5335,15 @@ window.__ModuleLoader__.load({
           h('thead', { key: 'thead' }, h('tr', null, [
             h('th', { key: 'session', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('table.sessions.session')),
             h('th', { key: 'requests', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.sessions.requests')),
-            h('th', { key: 'promptTokens', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.sessions.promptTokens')),
-            h('th', { key: 'outputTokens', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.sessions.outputTokens')),
+            h('th', { key: 'inputUncached', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.tokens.inputUncached')),
+            h('th', { key: 'outputTokens', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.tokens.output')),
+            h('th', { key: 'inputCached', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.tokens.inputCached')),
             h('th', { key: 'cacheRate', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.sessions.cacheRate')),
             h('th', { key: 'cost', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.cost')),
           ])),
           h('tbody', { key: 'tbody' }, rows.map(node => {
             const stats = node.subtree ?? subtreeStats(node)
+            const split = splitTokenCounts(stats)
             const hasChildren = node.children.length > 0
             const open = expanded[node.key] === true
             const toggleLabel = open ? t('table.sessions.collapse') : t('table.sessions.expand')
@@ -5308,11 +5422,14 @@ window.__ModuleLoader__.load({
             return h('tr', { key: node.key, 'data-session-row': node.key }, [
               h('td', { key: 'session', style: { ...cellStyle, textAlign: 'left' } }, sessionCell),
               h('td', { key: 'requests', style: { ...rightCell } }, formatTokens(stats.requests)),
-              h('td', { key: 'promptTokens', style: { ...rightCell } }, stats.splitAvailable
-                ? tokenCell(stats.promptTokens)
+              h('td', { key: 'inputUncached', style: { ...rightCell } }, stats.splitAvailable
+                ? tokenCell(split.uncached, TOKEN_COLORS.input)
                 : t('card.valueUnavailable')),
               h('td', { key: 'outputTokens', style: { ...rightCell } }, stats.splitAvailable
-                ? tokenCell(stats.outputTokens)
+                ? tokenCell(split.output, TOKEN_COLORS.output)
+                : t('card.valueUnavailable')),
+              h('td', { key: 'inputCached', style: { ...rightCell } }, stats.splitAvailable && split.available
+                ? tokenCell(split.cached, TOKEN_COLORS.cached)
                 : t('card.valueUnavailable')),
               h('td', { key: 'cacheRate', style: { ...rightCell } }, stats.cacheRate === null
                 ? t('card.valueUnavailable')
@@ -5566,9 +5683,9 @@ window.__ModuleLoader__.load({
           h('th', { key: 'time', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('requests.time')),
           h('th', { key: 'session', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('details.session')),
           h('th', { key: 'purpose', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('requests.purpose')),
-          h('th', { key: 'prompt', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.prompt')),
-          h('th', { key: 'output', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.output')),
-          h('th', { key: 'cacheRead', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.cacheRead')),
+          h('th', { key: 'inputUncached', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.inputUncached')),
+          h('th', { key: 'output', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.tokens.output')),
+          h('th', { key: 'inputCached', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('requests.inputCached')),
           h('th', { key: 'cost', scope: 'col', style: { ...headStyle, textAlign: 'right' } }, t('table.cost')),
           h('th', { key: 'unpricedReason', scope: 'col', style: { ...headStyle, textAlign: 'left' } }, t('details.unpricedReason')),
         ])),
@@ -5576,9 +5693,11 @@ window.__ModuleLoader__.load({
           h('td', { key: 'time', style: { ...cellStyle, textAlign: 'left', fontVariantNumeric: 'tabular-nums' } }, formatTime(row.ts)),
           h('td', { key: 'session', style: { ...cellStyle, textAlign: 'left' } }, requestSessionCell(row, sessionTitles, t)),
           h('td', { key: 'purpose', style: { ...cellStyle, textAlign: 'left' } }, purposeLabel(t, row.purpose)),
-          h('td', { key: 'prompt', style: rightCell }, tokenCell(row.promptTokens)),
-          h('td', { key: 'output', style: rightCell }, tokenCell(row.outputTokens)),
-          h('td', { key: 'cacheRead', style: rightCell }, tokenCell(row.cacheReadTokens)),
+          h('td', { key: 'inputUncached', style: rightCell }, tokenCell(splitTokenCounts(row).uncached, TOKEN_COLORS.input)),
+          h('td', { key: 'output', style: rightCell }, tokenCell(row.outputTokens, TOKEN_COLORS.output)),
+          h('td', { key: 'inputCached', style: rightCell }, splitTokenCounts(row).available
+            ? tokenCell(splitTokenCounts(row).cached, TOKEN_COLORS.cached)
+            : t('card.valueUnavailable')),
           h('td', { key: 'cost', style: rightCell }, formatCostCell(row.cost, undefined, { mixed: t('table.costMixed') })),
           h('td', {
             key: 'unpricedReason',
@@ -6262,6 +6381,7 @@ window.__ModuleLoader__.load({
           hint: card.hint,
           lines: card.lines,
           tone: card.tone,
+          valueColor: card.valueColor,
         }))),
       ]))
       if (detail.detailAvailable === false) {
@@ -6395,6 +6515,7 @@ window.__ModuleLoader__.load({
           requests: stats.requests,
           promptTokens: stats.splitAvailable ? stats.promptTokens : null,
           outputTokens: stats.splitAvailable ? stats.outputTokens : null,
+          cache: stats.cache,
           cost: stats.cost,
         }
       }).sort((left, right) => (right.tokens - left.tokens) || left.sessionId.localeCompare(right.sessionId))
@@ -6444,16 +6565,25 @@ window.__ModuleLoader__.load({
             render: row => formatTokens(row.requests),
           },
           {
-            key: 'promptTokens',
-            label: t('table.sessions.promptTokens'),
+            key: 'inputUncached',
+            label: t('table.tokens.inputUncached'),
             align: 'right',
-            render: row => (row.promptTokens !== null ? tokenCell(row.promptTokens) : t('card.valueUnavailable')),
+            render: row => (row.promptTokens !== null ? tokenCell(splitTokenCounts(row).uncached, TOKEN_COLORS.input) : t('card.valueUnavailable')),
           },
           {
             key: 'outputTokens',
-            label: t('table.sessions.outputTokens'),
+            label: t('table.tokens.output'),
             align: 'right',
-            render: row => (row.outputTokens !== null ? tokenCell(row.outputTokens) : t('card.valueUnavailable')),
+            render: row => (row.outputTokens !== null ? tokenCell(row.outputTokens, TOKEN_COLORS.output) : t('card.valueUnavailable')),
+          },
+          {
+            key: 'inputCached',
+            label: t('table.tokens.inputCached'),
+            align: 'right',
+            render: row => {
+              const split = splitTokenCounts(row)
+              return split.available ? tokenCell(split.cached, TOKEN_COLORS.cached) : t('card.valueUnavailable')
+            },
           },
           {
             key: 'cost',
@@ -6812,16 +6942,25 @@ window.__ModuleLoader__.load({
           render: row => formatTokens(row.requests),
         },
         {
-          key: 'promptTokens',
-          label: t('table.models.promptTokens'),
+          key: 'inputUncached',
+          label: t('table.tokens.inputUncached'),
           align: 'right',
-          render: row => tokenCell(row.promptTokens),
+          render: row => tokenCell(splitTokenCounts(row).uncached, TOKEN_COLORS.input),
         },
         {
           key: 'outputTokens',
-          label: t('table.models.outputTokens'),
+          label: t('table.tokens.output'),
           align: 'right',
-          render: row => tokenCell(row.outputTokens),
+          render: row => tokenCell(splitTokenCounts(row).output, TOKEN_COLORS.output),
+        },
+        {
+          key: 'inputCached',
+          label: t('table.tokens.inputCached'),
+          align: 'right',
+          render: row => {
+            const split = splitTokenCounts(row)
+            return split.available ? tokenCell(split.cached, TOKEN_COLORS.cached) : t('card.valueUnavailable')
+          },
         },
         {
           key: 'cost',
@@ -6878,6 +7017,7 @@ window.__ModuleLoader__.load({
           value: formatCompactTokens(totals.promptTokens),
           valueTitle: formatTokens(totals.promptTokens),
           hint: t('card.promptHint'),
+          valueColor: TOKEN_COLORS.input,
         },
         {
           key: 'output',
@@ -6885,6 +7025,7 @@ window.__ModuleLoader__.load({
           value: formatCompactTokens(totals.outputTokens),
           valueTitle: formatTokens(totals.outputTokens),
           hint: t('card.outputHint'),
+          valueColor: TOKEN_COLORS.output,
         },
         {
           key: 'cache',
@@ -6958,6 +7099,7 @@ window.__ModuleLoader__.load({
           hint: card.hint,
           lines: card.lines,
           tone: card.tone,
+          valueColor: card.valueColor,
         }))),
         h(StackedBar, {
           key: 'purpose',

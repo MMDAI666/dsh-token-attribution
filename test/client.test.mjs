@@ -732,7 +732,7 @@ test('panel components render with a minimal hook runtime without throwing', () 
   const dashboard = components.OverviewTab({ summary, meta, t, channel: '/token-attribution' })
   assert.equal(dashboard.type, 'div')
   const dashboardText = textOf(dashboard)
-  for (const expected of ['总 tokens（含缓存）', '按调用目的', '按内容来源', '会话 Top', '模型', '口径说明', '未定价请求', '输入', '输出']) {
+  for (const expected of ['总 Token（含缓存）', '按调用目的', '按内容来源', '会话 Top', '模型', '口径说明', '未定价请求', '输入', '输出']) {
     assert.ok(dashboardText.includes(expected), `dashboard renders ${expected}`)
   }
   const panel = components.UsagePanel({ localeRuntime: locale, rpc })
@@ -953,15 +953,19 @@ test('formatDayLabel and buildTrendPoints keep oldest-first geometry inside the 
   assert.deepEqual(layout.points.map(point => point.day), ['2026-11-09', '2026-11-10', '2026-11-11', '2026-11-12'])
   assert.deepEqual(layout.points.map(point => point.label), ['11-09', '11-10', '11-11', '11-12'])
   assert.equal(layout.totals.promptTokens, 110)
+  assert.equal(layout.totals.inputUncachedTokens, 110)
+  assert.equal(layout.totals.inputCachedTokens, 0)
   assert.equal(layout.totals.outputTokens, 55)
   assert.equal(layout.totals.tokens, 165)
   assert.equal(layout.maxTotal, 150)
   for (const point of layout.points) {
     assert.ok(point.x >= 0, `x is non-negative for ${point.day}`)
     assert.ok(point.x + point.barWidth <= 600 + 1e-9, `bars stay inside the viewBox for ${point.day}`)
-    assert.ok(point.promptHeight >= 0 && point.promptY >= -1e-9, `prompt geometry for ${point.day}`)
+    assert.ok(point.inputUncachedHeight >= 0 && point.inputUncachedY >= -1e-9, `uncached input geometry for ${point.day}`)
+    assert.ok(point.inputCachedHeight >= 0 && point.inputCachedY >= -1e-9, `cached input geometry for ${point.day}`)
     assert.ok(point.outputHeight >= 0 && point.outputY >= -1e-9, `output geometry for ${point.day}`)
-    assert.ok(point.promptY + point.promptHeight <= 96 + 1e-9, `prompt stays inside the height for ${point.day}`)
+    assert.ok(point.inputUncachedY + point.inputUncachedHeight <= 96 + 1e-9, `uncached input stays inside the height for ${point.day}`)
+    assert.ok(point.inputCachedY + point.inputCachedHeight <= 96 + 1e-9, `cached input stays inside the height for ${point.day}`)
     assert.ok(point.outputY + point.outputHeight <= 96 + 1e-9, `output stays inside the height for ${point.day}`)
   }
   const last = layout.points[layout.points.length - 1]
@@ -975,9 +979,19 @@ test('formatDayLabel and buildTrendPoints keep oldest-first geometry inside the 
   assert.equal(single.points[0].barWidth, 28)
   assert.ok(single.points[0].x > 0 && single.points[0].x + single.points[0].barWidth <= 600)
   const emptyDay = layout.points[1]
-  assert.equal(emptyDay.promptHeight, 0)
+  assert.equal(emptyDay.inputUncachedHeight, 0)
+  assert.equal(emptyDay.inputCachedHeight, 0)
   assert.equal(emptyDay.outputHeight, 0)
-  assert.equal(emptyDay.promptY, 96)
+  assert.equal(emptyDay.promptY, undefined)
+  assert.equal(emptyDay.inputUncachedY, 96)
+
+  const cachedLayout = buildTrendPoints([
+    { day: '2026-11-11', promptTokens: 100, outputTokens: 10, cache: { input: 10, read: 70, write: 5 } },
+  ], 600, 96)
+  assert.equal(cachedLayout.totals.inputUncachedTokens, 25)
+  assert.equal(cachedLayout.totals.inputCachedTokens, 75)
+  assert.equal(cachedLayout.totals.outputTokens, 10)
+  assert.equal(cachedLayout.points[0].inputCachedHeight > 0, true, 'cached input gets its own bar segment')
 
   assert.deepEqual(buildTrendPoints(null, 600, 96).points, [])
   assert.deepEqual(buildTrendPoints([], 600, 96).points, [])
@@ -1311,7 +1325,7 @@ test('new M2 locale keys exist in both dictionaries', () => {
   assert.equal(locales.zh['table.costMixed'], '混币')
   assert.equal(locales.zh['chart.category.expand'], '展开明细')
   assert.equal(locales.zh['chart.category.collapse'], '收起明细')
-  assert.equal(locales.zh['chart.category.detailShare'], '占 prompt')
+  assert.equal(locales.zh['chart.category.detailShare'], '占总输入')
   assert.equal(locales.zh['footnote.costCurrencyItem'], '{currency} {amount}（未定价 {count}）')
 })
 
@@ -1358,8 +1372,8 @@ test('M2 sections render inside the overview tab and the details pane', () => {
   assert.equal(trend.type, 'section')
   const trendText = textOf(trend)
   assert.ok(trendText.includes('按天趋势'))
-  assert.ok(trendText.includes('11-09 · prompt 10 · output 5'), trendText)
-  assert.ok(trendText.includes('Prompt') && trendText.includes('Output'), 'trend legend labels are rendered')
+  assert.ok(trendText.includes('11-09 · 未缓存 10 · 输出 5 · 缓存 0'), trendText)
+  assert.ok(trendText.includes('输入（未缓存）') && trendText.includes('输出') && trendText.includes('输入（缓存）'), 'trend legend labels are rendered')
   assert.ok(textOf(components.TrendChart({ byDay: [], t })).includes('该范围内暂无按天数据'))
 
   const ready = components.DetailsTab({
@@ -1519,7 +1533,7 @@ test('category detail expands every source with tokens and prompt share', () => 
   })
 
   const overview = textOf(components.OverviewTab({ summary, meta: null, t, channel: '' }))
-  assert.ok(!overview.includes('占 prompt'), 'the overview keeps the compact content-source bar')
+  assert.ok(!overview.includes('占总输入'), 'the overview keeps the compact content-source bar')
   assert.ok(!overview.includes('展开明细'), 'the overview no longer carries the drill-down toggle')
 
   const expanded = textOf(components.SourcesTab({ summary, t }))
@@ -1535,7 +1549,7 @@ test('category detail expands every source with tokens and prompt share', () => 
   ]) {
     assert.ok(expanded.includes(label), `sources detail lists ${label}`)
   }
-  assert.ok(expanded.includes('占 prompt'), 'sources detail renders the prompt-share column')
+  assert.ok(expanded.includes('占总输入'), 'sources detail renders the prompt-share column')
   assert.ok(expanded.includes('50.0%'), 'the largest category shows its prompt share')
   assert.ok(expanded.includes('20.0%'), 'the second category shows its prompt share')
   assert.ok(expanded.includes('合计 1K'), 'sources keeps the compact total in the stacked bar')
@@ -1812,7 +1826,7 @@ test('M2.1 session tree and grouped stacked bar render in the dashboard', () => 
     ],
   })
   const collapsed = textOf(components.SessionsTab({ summary, t, sessionTitles: null }))
-  for (const expected of ['会话 Top', '缓存率', '默认仅显示根会话', 'root-session', '输入', '输出', '1.5K', '83.3%', '¥0.150']) {
+  for (const expected of ['会话 Top', '缓存率', '默认仅显示根会话', 'root-session', '输入（未缓存）', '输出', '输入（缓存）', '83.3%', '¥0.150']) {
     assert.ok(collapsed.includes(expected), `collapsed tree renders ${expected}`)
   }
   assert.ok(!collapsed.includes('child-only'), 'children stay hidden while collapsed')
@@ -1859,7 +1873,7 @@ test('M2.1 session tree and grouped stacked bar render in the dashboard', () => 
   const childCells = (childRow.props !== undefined && Array.isArray(childRow.props.children)
     ? childRow.props.children
     : Array.isArray(childRow.children) ? childRow.children : []).map(cell => textOf(cell))
-  assert.deepEqual(childCells, ['▸ 1 child-only 子代理', '2', '700', '300', '90.0%', '¥0.030'], 'child row shows split subtree input/output cells')
+  assert.deepEqual(childCells, ['▸ 1 child-only 子代理', '2', '250', '300', '450', '90.0%', '¥0.030'], 'child row shows split subtree input/output cells')
 
   const nested = textOf(components.SessionsTab({
     summary,
@@ -1997,6 +2011,7 @@ test('models table splits input/output and legacy sessions render unavailable sp
       promptTokens: 1000,
       outputTokens: 400,
       tokens: 1400,
+      cache: { input: 100, read: 800, write: 100 },
       cost: { amount: 0.1, currency: 'CNY', priced: true },
     }],
     bySession: [{ sessionId: 'legacy-session', tokens: 1234, requests: 2 }],
@@ -2025,12 +2040,12 @@ test('models table splits input/output and legacy sessions render unavailable sp
     return found
   }
   const tables = collect(dashboard, 'table', [])
-  const modelTable = tables.find(table => textOf(table).includes('Provider'))
+  const modelTable = tables.find(table => textOf(table).includes('提供方'))
   assert.ok(modelTable !== undefined, 'the models table is rendered')
   const headers = collect(modelTable, 'th', []).map(cell => textOf(cell))
-  assert.deepEqual(headers, ['Provider', '模型', '请求数', '输入', '输出', '费用'])
+  assert.deepEqual(headers, ['提供方', '模型', '请求数', '输入（未缓存）', '输出', '输入（缓存）', '费用'])
   const cells = collect(modelTable, 'td', []).map(cell => textOf(cell))
-  assert.deepEqual(cells, ['deepseek-official', 'deepseek-flash', '2', '1K', '400', '¥0.100'])
+  assert.deepEqual(cells, ['deepseek-official', 'deepseek-flash', '2', '100', '400', '900', '¥0.100'])
 })
 
 test('M2.4 Web API card shows observed tool calls and the estimated cost', () => {
@@ -2126,7 +2141,7 @@ test('M2.4 footnote explains observed Web API calls and estimate limits', () => 
   }, language)
   const summary = normalizeSummary({ totals: { requests: 1 } })
   const zhFootnote = textOf(components.Footnote({ summary, meta: null, t: makeT('zh'), channel: '' }))
-  for (const expected of ['web_search', 'web_fetch', '成功调用按 provider 的按次定价计费', '每千次单价估算', '实际账单可能不同']) {
+  for (const expected of ['web_search', 'web_fetch', '成功调用按供应商的按次定价计费', '每千次单价估算', '实际账单可能不同']) {
     assert.ok(zhFootnote.includes(expected), `zh footnote states ${expected}`)
   }
   const enFootnote = textOf(components.Footnote({ summary, meta: null, t: makeT('en'), channel: '' }))
@@ -2897,7 +2912,7 @@ test('M2.6 Sessions, Models, Sources and Web tabs render their full tables', () 
   }
 
   const sourcesText = textOfM26(components.SourcesTab({ summary, t }))
-  for (const expected of ['按内容来源', '来源明细', '占 prompt', '工具分组', '记忆', '技能', '其他·web_search', 'Agent Teams', '历史', '60.0%', '600']) {
+  for (const expected of ['按内容来源', '来源明细', '占总输入', '工具分组', '记忆', '技能', '其他·web_search', 'Agent Teams', '历史', '60.0%', '600']) {
     assert.ok(sourcesText.includes(expected), `sources tab renders ${expected}`)
   }
   assert.ok(sourcesText.includes('30.0%'), 'tool-result share is derived from the prompt total')
@@ -4623,7 +4638,7 @@ test('M3 SessionDetailView renders the full mini dashboard', () => {
     '当前为子树汇总',
     '含子代理',
     '本会话摘要',
-    '总 tokens（含缓存）',
+    '总 Token（含缓存）',
     '按调用目的',
     '主对话',
     'deepseek-flash',
@@ -4663,7 +4678,7 @@ test('M3 SessionDetailView renders the full mini dashboard', () => {
   assert.ok(childRow, 'the direct child row renders')
   assert.deepEqual(
     childRow.props.children.map(cell => textOfM26(cell)),
-    ['子会话标题', '2', '150', '50', '¥0.050'],
+    ['子会话标题', '2', '150', '50', '—', '¥0.050'],
     'child cells show the child subtree totals (including the grandchild)',
   )
   childButton.props.onClick()
@@ -4716,7 +4731,7 @@ test('M3 detail falls back when attribution detail is unavailable or the session
   }))
   assert.ok(fallback.includes('明细仅保留 30 天，无法展开归因'), 'the localized fallback note is shown')
   assert.ok(fallback.includes('根会话标题'), 'the session header still renders')
-  assert.ok(fallback.includes('总 tokens（含缓存）'), 'summary cards still render')
+  assert.ok(fallback.includes('总 Token（含缓存）'), 'summary cards still render')
   for (const hidden of ['按调用目的', '按内容来源', '工具分组', '按天趋势', '直接子会话', '本会话请求明细']) {
     assert.ok(!fallback.includes(hidden), `the unavailable fallback hides ${hidden}`)
   }
@@ -5198,6 +5213,9 @@ test('M4 unpriced reasons render on the cost card and in the Details filter', ()
   assert.ok(text.includes('只看未定价'))
   assert.ok(text.includes('未定价原因'))
   assert.ok(text.includes('中断'))
+  assert.ok(text.includes('输入（未缓存）'))
+  assert.ok(text.includes('输入（缓存）'))
+  assert.ok(text.includes('输出'))
   assert.equal(detailsRequestPayload({ from: '2026-11-01', to: '2026-11-13' }, { unpricedOnly: true }).unpricedOnly, true)
   assert.equal(detailsReducer(state, { type: 'filters', unpricedOnly: false }).unpricedOnly, false)
 

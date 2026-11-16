@@ -698,6 +698,7 @@ test('readSummary byDay is oldest-first, per-day, and includes queued records', 
       promptTokens: 150,
       outputTokens: 15,
       estimatedRequests: 1,
+      cache: { input: 180, read: 20, write: 0 },
       cost: { amount: 0.01, currency: 'CNY', priced: true, unpricedRequests: 1 },
       costByCurrency: { CNY: { amount: 0.01, priced: true, unpricedRequests: 1 } },
     },
@@ -707,6 +708,7 @@ test('readSummary byDay is oldest-first, per-day, and includes queued records', 
       promptTokens: 30,
       outputTokens: 3,
       estimatedRequests: 0,
+      cache: { input: 90, read: 10, write: 0 },
       cost: { amount: 0.02, currency: 'CNY', priced: true, unpricedRequests: 0 },
       costByCurrency: { CNY: { amount: 0.02, priced: true, unpricedRequests: 0 } },
     },
@@ -716,6 +718,7 @@ test('readSummary byDay is oldest-first, per-day, and includes queued records', 
       promptTokens: 20,
       outputTokens: 2,
       estimatedRequests: 0,
+      cache: { input: 90, read: 10, write: 0 },
       cost: { amount: 0, currency: 'CNY', priced: false, unpricedRequests: 1 },
       costByCurrency: { CNY: { amount: 0, priced: false, unpricedRequests: 1 } },
     },
@@ -2522,6 +2525,7 @@ test('readSessionDetail scopes a full dashboard to one session and its subtree',
       promptTokens: 150,
       outputTokens: 15,
       estimatedRequests: 0,
+      cache: { input: 130, read: 20, write: 0 },
       cost: { amount: 0.03, currency: 'CNY', priced: true, unpricedRequests: 0 },
       costByCurrency: { CNY: { amount: 0.03, priced: true, unpricedRequests: 0 } },
     },
@@ -2531,6 +2535,7 @@ test('readSessionDetail scopes a full dashboard to one session and its subtree',
       promptTokens: 50,
       outputTokens: 5,
       estimatedRequests: 0,
+      cache: { input: 40, read: 10, write: 0 },
       cost: { amount: 0.005, currency: 'CNY', priced: true, unpricedRequests: 1 },
       costByCurrency: { CNY: { amount: 0.005, priced: true, unpricedRequests: 1 } },
     },
@@ -2856,5 +2861,17 @@ test('summary exposes unpriced reasons and requests can filter unpriced rows', (
   assert.equal(page.total, 4)
   assert.deepEqual(page.items.map(row => row.id).sort(), ['aborted', 'no-price', 'no-usage', 'transport'])
   assert.equal(store.readRequests({ from: day, to: day, unpricedOnly: false }).total, 5)
+  store.dispose()
+})
+test('summary exposes per-model cache buckets for the three-way token columns', (t) => {
+  const home = tempHome(t)
+  const store = createStore({ config: makeConfig(), homeDir: home, profile: 'test' })
+  const day = dayKey(Date.now())
+  store.append(makeRecord({ id: 'mc1', ts: Date.now(), promptTokens: 850, usage: { input: 100, cacheRead: 700, cacheWrite: 50, output: 20 } }))
+  store.flush()
+  const summary = store.readSummary({ from: day, to: day })
+  assert.equal(summary.byModel.length, 1)
+  assert.deepEqual(summary.byModel[0].cache, { input: 100, read: 700, write: 50 })
+  assert.equal(summary.byModel[0].promptTokens, 850)
   store.dispose()
 })

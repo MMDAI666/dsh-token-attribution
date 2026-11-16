@@ -9,7 +9,7 @@
 - **全量调用捕获**：观察 `llm/stream`，覆盖主对话、子代理、`auto-review`、`compaction`、`session-title` 与重试 attempt，总量锚定 provider 真实 usage。
 - **归因与费用**：按调用目的、内容来源分组（含记忆/技能）、会话树、模型拆分；按北京时间自动选择高峰/空闲价，价目表可配，可补法定节假日日期。
 - **搜索/抓取监控**：统计 Host 观察到的 `web_search` / `web_fetch` 次数并估算费用，可归因到具体对话；升级前（M2.5 之前）的调用以「未归因」余量显式呈现。
-- **七标签页面板**：概览 / 会话 / 模型 / 来源 / 搜索 / 明细 / 设置；共享时间范围、刷新与 JSON/CSV 导出；请求明细分页；会话标题渲染时解析；会话 Tab 支持进入单会话详情（含子代理子树切换）；可选记住上次标签页。
+- **七标签页面板**：概览 / 会话 / 模型 / 来源 / 搜索 / 明细 / 设置；共享时间范围、刷新与 JSON/CSV 导出；请求明细分页；会话标题渲染时解析；会话 Tab 支持进入单会话详情（含子代理子树切换）；token 表拆分为输入（未缓存）/ 输出 / 输入（缓存）并用不同颜色区分；可选记住上次标签页。
 
 ## 快速开始
 
@@ -31,6 +31,7 @@
 
 ## 最近更新
 
+- **M5** — 会话 / 模型 / 明细表与按天趋势图把 token 拆成「输入（未缓存） / 输出 / 输入（缓存）」三类，使用不同颜色；补齐中文界面标签（Output、Provider 等）。
 - **M4** — 未定价请求不再只显示总数：费用卡按原因拆分（中断 / 传输失败 / 无 usage / 未配置价格 / 未知），明细 Tab 增加「只看未定价」筛选并显示每条请求的原因。
 - **M3** — 「会话」Tab 可点击进入单会话详情：默认含子代理子树、可切换仅本会话；迷你看板含会话卡、purpose、模型、内容来源、工具分组、搜索/抓取、趋势、子会话与请求明细；父/子会话可导航，切换 Tab 保留选中，范围变化重算。
 - **M2.10** — 自动审查（auto-review）每次重发的合成 user 角色转录从**用户**中拆出，单列为**自动审查**内容来源分组（保留明细已迁移；更早只有日聚合的日期不变；真正的聊天用户文本仅占聊天 prompt 约 0.5%）。
@@ -60,7 +61,7 @@ node --check index.js
 node --test --test-isolation=none "test/*.test.mjs"
 ```
 
-当前单测为 **287 个**（2026-11-13 实测；M4 收尾期间数量可能继续变化，按近似值看待）。测试使用 `node:test`、合成 fixture 与临时 `DSH_HOME`，不会读写真实 profile。在 DSH Windows 沙箱内请使用上面的 in-process runner（`--test-isolation=none`）：默认 runner 以管道 stdio 启动子进程，会报 `spawn EPERM`。
+当前单测为 **288 个**（2026-11-16 实测；M5 收尾期间数量可能继续变化，按近似值看待）。测试使用 `node:test`、合成 fixture 与临时 `DSH_HOME`，不会读写真实 profile。在 DSH Windows 沙箱内请使用上面的 in-process runner（`--test-isolation=none`）：默认 runner 以管道 stdio 启动子进程，会报 `spawn EPERM`。
 
 要求 Node.js 24+，DSH 引擎范围为 `>=0.2.1-rc.1 <0.3.0`；零运行时依赖、无构建步骤。
 
@@ -81,7 +82,7 @@ A DSH plugin that records every model call in the running profile — including 
 - **Full call capture.** An observer on `llm/stream` sees main chat, subagents, `auto-review`, `compaction`, `session-title`, and retry attempts, all anchored to measured provider usage.
 - **Attribution and cost.** Purpose, content-source groups (including memory/skill), session tree, per-model split; tiered peak/off-peak pricing in Asia/Shanghai, configurable price table, and optional holiday dates.
 - **Search & fetch tracking.** Host-observed `web_search` / `web_fetch` counts and estimated cost, attributed per conversation, with an explicit unattributed remainder for pre-M2.5 history.
-- **Seven-tab panel.** Overview / Sessions / Models / Sources / Search / Details / Settings, with a shared range, refresh, and JSON/CSV export, paginated request details, render-time session titles, a single-session drill-down on the Sessions tab (with subtree toggle), and optional last-tab memory.
+- **Seven-tab panel.** Overview / Sessions / Models / Sources / Search / Details / Settings, with a shared range, refresh, and JSON/CSV export, paginated request details, render-time session titles, a single-session drill-down on the Sessions tab (with subtree toggle), three-way token columns (input uncached / output / input cached) with distinct colors, and optional last-tab memory.
 
 ### Quick start
 
@@ -103,6 +104,7 @@ Uninstall with the plugin manager's **remove bundle** action. Removal does not d
 
 ### What's new
 
+- **M5** — token tables and the daily trend chart split tokens into **Input (uncached) / Output / Input (cached)** with distinct colors; Chinese UI labels completed (Output, Provider, and related terms).
 - **M4** — unpriced requests now split by cause on the cost card (aborted / transport / no usage / no price / unknown), and the Details tab has an **Unpriced only** filter plus a per-row reason.
 - **M3** — the Sessions tab opens a single-session drill-down (subtree by default, switchable to this session only): overview cards, purpose, models, content sources, tool groups, search/fetch, trend, child sessions, and paginated requests; parent/child navigation, selection survives tab switches, and a range change refetches.
 - **M2.10** — auto-review's synthetic user-role transcript is split out of **用户 / User** into its own **自动审查 / Auto review** content-source group (retained detail migrated; daily-only older days unchanged; genuine chat user text is ~0.5% of the chat prompt).
@@ -132,7 +134,7 @@ node --check index.js
 node --test --test-isolation=none "test/*.test.mjs"
 ```
 
-The suite currently reports **287 tests** (observed 2026-11-13; the count is approximate while M4 settles). Tests use `node:test`, synthetic fixtures, and temporary `DSH_HOME` directories — they never read or write a real profile. In the DSH Windows sandbox use the in-process runner (`--test-isolation=none`) as shown; the default runner spawns child processes with piped stdio and fails with `spawn EPERM`.
+The suite currently reports **288 tests** (observed 2026-11-16; the count is approximate while M5 settles). Tests use `node:test`, synthetic fixtures, and temporary `DSH_HOME` directories — they never read or write a real profile. In the DSH Windows sandbox use the in-process runner (`--test-isolation=none`) as shown; the default runner spawns child processes with piped stdio and fails with `spawn EPERM`.
 
 Requires Node.js 24 or newer and the DSH `>=0.2.1-rc.1 <0.3.0` engine range. No runtime dependencies and no build step.
 

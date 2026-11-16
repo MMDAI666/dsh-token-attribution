@@ -75,6 +75,8 @@ amount = Σ tokens(bucket) × price(bucket, tier) / 1,000,000
 
 All amounts remain configured-price estimates, not a provider bill.
 
+The token tables split input tokens into **uncached input** (`prompt − cacheRead − cacheWrite`), **cached input** (`cacheRead + cacheWrite`), and **output**. The three columns use distinct theme colors, and the daily trend chart stacks the same three series. Daily model entries carry the same cache buckets since this change; retained daily files are backfilled from detail once (`meta.modelCacheVersion`), while rows without measured cache buckets keep the prompt total in the uncached column and render the cached column as `—` rather than inventing a split.
+
 Unpriced requests are counted separately and are never assigned a fabricated cost. Since M4, `summary.unpricedReasons` splits the count by cause: `aborted`, `transport`, `no-usage`, `no-price`, and `other`; a legacy daily file without the reason map contributes an `unknown` remainder. The cost card renders this breakdown, and the Details tab can filter to unpriced rows and shows the per-request reason. A request is `no-price` when the Host has measured usage but no matching price entry, and `no-usage` when the provider returned no usage (aborted/transport failures take precedence).
 
 ## Web API counts and estimates

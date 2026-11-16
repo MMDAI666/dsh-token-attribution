@@ -38,9 +38,11 @@ The overview Top 5 tables are read-only summaries: no expand chevrons on the ses
 
 ### Sessions
 
-The session tree starts with root sessions only. Every row shows **subtree totals** (the session plus all descendants) for requests, input, output, cost, and cache rate. A chevron with a direct-child count expands one level; nested expand/collapse works recursively. A non-root row keeps the `子代理 / Subagent` badge when its parent is expanded. Cache rate is `cacheRead / (input + cacheRead + cacheWrite)` of the row's subtree; a zero denominator renders `—`.
+The session tree starts with root sessions only. Every row shows **subtree totals** (the session plus all descendants) for requests, **输入（未缓存）/ 输出 / 输入（缓存）**, cost, and cache rate. The three token columns use distinct theme colors; cached input is cache read + cache write, and uncached input is the remainder of the prompt total. A chevron with a direct-child count expands one level; nested expand/collapse works recursively. A non-root row keeps the `子代理 / Subagent` badge when its parent is expanded. Cache rate is `cacheRead / (input + cacheRead + cacheWrite)` of the row's subtree; a zero denominator renders `—`.
 
 Session titles resolve at render time from the live `useSessions` store (`displayTitle`, then `title`, then the compact id). Titles are never persisted or sent over RPC. Up to 500 sessions are returned; the tree shows all roots in the range.
+
+The daily trend chart stacks the same three token kinds per day: uncached input (blue), output (green), and cached input (amber). Each bar's tooltip shows all three; the legend totals reconcile to the range totals. Days without cache buckets show their prompt total as uncached and zero cached.
 
 Since M3, clicking a session title opens an in-place **session drill-down** (the chevron still only expands the tree). It defaults to the session plus its descendant subtree and has a `含子代理 / 仅本会话` switch that refetches the scoped data. The detail header has a back action and ancestor breadcrumb; direct child sessions are listed with their subtree totals and can be opened for further drilling. The mini dashboard contains session cards, purpose, models, content sources, tool groups, search/fetch calls, daily trend, and paginated request rows for the selected session set. Drill state survives switching main tabs; a range change refetches it.
 
@@ -75,7 +77,7 @@ The Details tab is the only place that calls the `requests` endpoint. It sends t
 - The purpose filter is all / chat / auto-review / compaction / session-title; the session filter is all plus up to 100 sessions from `summary.bySession`, labelled with the resolved title and a short id. The **只看未定价 / Unpriced only** checkbox keeps rows whose cost is not priced.
 - `purpose` and `sessionId` are omitted when the filter is `all`; `sessionId` is only sent for a concrete selection; `unpricedOnly` is sent only when checked.
 - Changing the range, purpose, session, or unpriced filter resets pagination to offset 0. **加载更多 / Load more** appends the next 20 rows until the Host's filtered `total`.
-- The table columns are time, session (resolved title, full id in the tooltip), purpose, prompt, output, cacheRead, cost, and the unpriced reason (中断 / 传输失败 / 无 usage / 未配置价格 / 未知; empty for priced rows).
+- The table columns are time, session (resolved title, full id in the tooltip), purpose, **输入（未缓存）**, output, **输入（缓存）**, cost, and the unpriced reason (中断 / 传输失败 / 无 usage / 未配置价格 / 未知; empty for priced rows). The three token columns use the same input/output/cached colors as the session and model tables.
 - A range change that resolves new `from`/`to` (for example across midnight) resets the pane to page 1, so pages from two windows are never mixed. A mid-list RPC failure keeps already-loaded rows visible; retry re-requests the current window.
 - Against a pre-M2.6 Host that does not accept `sessionId`, picking a concrete session returns `bad-request` and the pane shows the error with retry. With no session selected the old payload shape is used.
 
